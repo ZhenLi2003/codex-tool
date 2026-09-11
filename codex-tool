@@ -1,0 +1,728 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 022
+
+TOOL_VERSION="1.5.0"
+TOOL_HOME="${CODEX_TOOL_HOME:-$HOME/scripts/codex-tool}"
+VERSIONS_DIR="$TOOL_HOME/versions"
+DOWNLOADS_DIR="$TOOL_HOME/downloads"
+CURRENT_LINK="$TOOL_HOME/current"
+LOCAL_BIN="${CODEX_TOOL_BIN_DIR:-$HOME/.local/bin}"
+CODEX_COMMAND="$LOCAL_BIN/codex"
+TOOL_COMMAND="$LOCAL_BIN/codex-tool"
+CODEX_DATA_DIR="${CODEX_HOME:-$HOME/.codex}"
+REPO="openai/codex"
+API_BASE="https://api.github.com/repos/$REPO"
+TARGET="x86_64-unknown-linux-musl"
+PACKAGE_ASSET="codex-package-${TARGET}.tar.gz"
+CHECKSUM_ASSET="codex-package_SHA256SUMS"
+HISTORY_KEEP="${CODEX_TOOL_HISTORY_KEEP:-2}"
+API_TIMEOUT="${CODEX_TOOL_API_TIMEOUT:-120}"
+CONNECT_TIMEOUT="${CODEX_TOOL_CONNECT_TIMEOUT:-30}"
+DOWNLOAD_RETRIES="${CODEX_TOOL_DOWNLOAD_RETRIES:-8}"
+DOWNLOAD_RETRY_DELAY="${CODEX_TOOL_DOWNLOAD_RETRY_DELAY:-5}"
+DOWNLOAD_STALL_TIME="${CODEX_TOOL_DOWNLOAD_STALL_TIME:-180}"
+DOWNLOAD_MAX_TIME="${CODEX_TOOL_DOWNLOAD_MAX_TIME:-0}"
+SELF_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+WORK_DIR=""
+
+log()  { printf '==> %s\n' "$*"; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+cleanup() {
+  if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then
+    rm -rf -- "$WORK_DIR"
+  fi
+}
+trap cleanup EXIT
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  codex-tool install X.Y.Z          Install/repair and activate a stable version
+  codex-tool update                 Install/activate the latest stable version
+  codex-tool delete X.Y.Z           Delete an installed non-current version
+  codex-tool clean [--yes]          Clear Codex data except config.toml and auth.json
+  codex-tool prune [--yes] [--force]
+                                    Remove all installed Codex versions/download cache
+                                    and the managed codex command link; keep codex-tool
+                                    and ~/.codex data
+  codex-tool list                   Show current and locally installed versions only
+  codex-tool switch X.Y.Z           Activate an already installed version
+  codex-tool version                Show codex-tool version
+  codex-tool help
+
+Environment:
+  GITHUB_TOKEN                      Optional GitHub token for higher API rate limits
+  CODEX_TOOL_HISTORY_KEEP=N         Historical versions retained (default: 2)
+  CODEX_TOOL_HOME=PATH              Manager directory (default: ~/scripts/codex-tool)
+  CODEX_TOOL_BIN_DIR=PATH           Command-link directory (default: ~/.local/bin)
+  CODEX_HOME=PATH                   Codex data directory (default: ~/.codex)
+  CODEX_TOOL_API_TIMEOUT=N          GitHub API max time in seconds (default: 120)
+  CODEX_TOOL_CONNECT_TIMEOUT=N      Connection timeout in seconds (default: 30)
+  CODEX_TOOL_DOWNLOAD_RETRIES=N     Retries after first large download attempt (default: 8)
+  CODEX_TOOL_DOWNLOAD_RETRY_DELAY=N Delay between large download attempts (default: 5)
+  CODEX_TOOL_DOWNLOAD_STALL_TIME=N  Abort/resume if transfer stays below 1 B/s for N sec
+                                    (default: 180; 0 disables low-speed detection)
+  CODEX_TOOL_DOWNLOAD_MAX_TIME=N    Per-attempt large download max time (default: 0=no limit)
+
+GitHub API rate-limit fallback:
+  API requests normally honor the user's proxy environment/configuration. If GitHub
+  returns an API rate-limit 403, codex-tool prints a warning and retries that API
+  request once with proxies bypassed. Asset downloads continue to honor the normal
+  proxy configuration.
+USAGE
+}
+
+need_cmd() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"; }
+
+validate_uint() {
+  local name="$1" value="$2"
+  [[ "$value" =~ ^[0-9]+$ ]] || die "$name must be a non-negative integer"
+}
+
+validate_version() {
+  local version="$1"
+  [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
+    || die "invalid stable version '$version'; expected X.Y.Z without rust-v or prerelease suffix"
+}
+
+ensure_supported_platform() {
+  [[ "$(uname -s)" == "Linux" ]] || die "this build supports Linux only"
+  case "$(uname -m)" in
+    x86_64|amd64) ;;
+    *) die "unsupported CPU architecture: $(uname -m); expected x86_64" ;;
+  esac
+}
+
+ensure_layout() { mkdir -p -- "$TOOL_HOME" "$VERSIONS_DIR" "$DOWNLOADS_DIR" "$LOCAL_BIN"; }
+
+lock_manager() {
+  need_cmd flock
+  exec 9>"$TOOL_HOME/.lock"
+  flock -x 9
+}
+
+make_work_dir() {
+  [[ -z "$WORK_DIR" ]] || return 0
+  WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/codex-tool.XXXXXXXX")"
+}
+
+# Print a short, safe diagnostic from a GitHub JSON error body.
+github_error_message() {
+  local body="$1"
+  python3 - "$body" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    with open(sys.argv[1], 'r', encoding='utf-8') as f:
+        obj = json.load(f)
+    msg = obj.get('message')
+    if isinstance(msg, str):
+        print(msg.replace('\n', ' ')[:500])
+except Exception:
+    pass
+PY
+}
+
+header_value() {
+  local headers="$1" name="$2"
+  awk -v wanted="${name,,}" '
+    BEGIN { IGNORECASE=1 }
+    {
+      line=$0; sub(/\r$/, "", line)
+      split(line, a, ":")
+      key=tolower(a[1])
+      if (key == wanted) {
+        sub(/^[^:]*:[[:space:]]*/, "", line)
+        value=line
+      }
+    }
+    END { if (value != "") print value }
+  ' "$headers"
+}
+
+is_rate_limit_response() {
+  local status="$1" headers="$2" body="$3"
+  [[ "$status" == "403" ]] || return 1
+  local remaining msg
+  remaining="$(header_value "$headers" "x-ratelimit-remaining")"
+  [[ "$remaining" == "0" ]] && return 0
+  msg="$(github_error_message "$body")"
+  [[ "${msg,,}" == *"rate limit"* ]]
+}
+
+github_api_once() {
+  local url="$1" body="$2" headers="$3" stderr_file="$4" mode="$5"
+  local -a args=(
+    --proto '=https'
+    --tlsv1.2
+    --silent
+    --show-error
+    --location
+    --connect-timeout "$CONNECT_TIMEOUT"
+    --max-time "$API_TIMEOUT"
+    --retry 0
+    -D "$headers"
+    -o "$body"
+    -w '%{http_code}'
+    -H 'Accept: application/vnd.github+json'
+    -H 'X-GitHub-Api-Version: 2022-11-28'
+    -H 'User-Agent: codex-tool'
+  )
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    args+=( -H "Authorization: Bearer ${GITHUB_TOKEN}" )
+  fi
+  if [[ "$mode" == "direct" ]]; then
+    # Explicitly override proxy env vars and any proxy configured by ~/.curlrc.
+    args+=( --proxy '' --noproxy '*' )
+  fi
+
+  local status rc
+  set +e
+  status="$(curl "${args[@]}" "$url" 2>"$stderr_file")"
+  rc=$?
+  set -e
+  printf '%s\n%s\n' "$rc" "${status:-000}"
+}
+
+# Fetch one GitHub REST API JSON document. Normal request uses the user's network
+# settings. Only an API rate-limit 403 triggers one explicit no-proxy retry.
+github_api_get() {
+  local url="$1" output="$2" label="${3:-GitHub API request}"
+  make_work_dir
+  local normal_body="$WORK_DIR/api-normal.$$.json"
+  local normal_headers="$WORK_DIR/api-normal.$$.headers"
+  local normal_err="$WORK_DIR/api-normal.$$.stderr"
+  local result rc status msg remaining reset
+
+  result="$(github_api_once "$url" "$normal_body" "$normal_headers" "$normal_err" normal)"
+  rc="$(sed -n '1p' <<<"$result")"
+  status="$(sed -n '2p' <<<"$result")"
+
+  if [[ "$rc" == "0" && "$status" =~ ^2[0-9][0-9]$ ]]; then
+    mv -f -- "$normal_body" "$output"
+    return 0
+  fi
+
+  if [[ "$rc" == "0" ]] && is_rate_limit_response "$status" "$normal_headers" "$normal_body"; then
+    remaining="$(header_value "$normal_headers" "x-ratelimit-remaining")"
+    reset="$(header_value "$normal_headers" "x-ratelimit-reset")"
+    msg="$(github_error_message "$normal_body")"
+    warn "$label was rejected by GitHub API rate limiting (HTTP $status${remaining:+, remaining=$remaining})."
+    [[ -n "$msg" ]] && warn "GitHub: $msg"
+    if [[ "$reset" =~ ^[0-9]+$ ]]; then
+      local reset_text
+      reset_text="$(date -d "@$reset" '+%Y-%m-%d %H:%M:%S %z' 2>/dev/null || true)"
+      [[ -n "$reset_text" ]] && warn "rate-limit reset reported by GitHub: $reset_text"
+    fi
+    warn "retrying this GitHub API request once with proxy use disabled; asset downloads will keep the normal proxy configuration."
+
+    local direct_body="$WORK_DIR/api-direct.$$.json"
+    local direct_headers="$WORK_DIR/api-direct.$$.headers"
+    local direct_err="$WORK_DIR/api-direct.$$.stderr"
+    result="$(github_api_once "$url" "$direct_body" "$direct_headers" "$direct_err" direct)"
+    rc="$(sed -n '1p' <<<"$result")"
+    status="$(sed -n '2p' <<<"$result")"
+
+    if [[ "$rc" == "0" && "$status" =~ ^2[0-9][0-9]$ ]]; then
+      warn "direct GitHub API retry succeeded; continuing without changing your proxy environment."
+      mv -f -- "$direct_body" "$output"
+      return 0
+    fi
+
+    warn "direct GitHub API retry also failed (curl exit $rc, HTTP $status)."
+    msg="$(github_error_message "$direct_body")"
+    [[ -n "$msg" ]] && warn "GitHub direct retry: $msg"
+    if [[ -s "$direct_err" ]]; then
+      warn "curl direct retry: $(tr '\n' ' ' < "$direct_err" | sed 's/[[:space:]]\+/ /g' | cut -c1-500)"
+    fi
+    return 1
+  fi
+
+  msg="$(github_error_message "$normal_body")"
+  warn "$label failed (curl exit $rc, HTTP $status)."
+  [[ -n "$msg" ]] && warn "GitHub: $msg"
+  if [[ -s "$normal_err" ]]; then
+    warn "curl: $(tr '\n' ' ' < "$normal_err" | sed 's/[[:space:]]\+/ /g' | cut -c1-500)"
+  fi
+  return 1
+}
+
+version_codex_path() {
+  local version="$1"
+  local dir="$VERSIONS_DIR/$version"
+  if [[ -x "$dir/bin/codex" ]]; then
+    printf '%s\n' "$dir/bin/codex"
+  elif [[ -x "$dir/codex" ]]; then
+    printf '%s\n' "$dir/codex"
+  else
+    return 1
+  fi
+}
+
+version_layout() {
+  local version="$1"
+  local dir="$VERSIONS_DIR/$version"
+  if [[ -f "$dir/codex-package.json" && -x "$dir/bin/codex" && -x "$dir/bin/codex-code-mode-host" && -x "$dir/codex-path/rg" ]]; then
+    printf 'package\n'
+  elif [[ -x "$dir/codex" ]]; then
+    printf 'legacy-single-binary\n'
+  else
+    printf 'incomplete\n'
+  fi
+}
+
+is_complete_package_dir() {
+  local dir="$1"
+  [[ -f "$dir/codex-package.json" ]] &&
+  [[ -x "$dir/bin/codex" ]] &&
+  [[ -x "$dir/bin/codex-code-mode-host" ]] &&
+  [[ -x "$dir/codex-path/rg" ]]
+}
+
+current_version() {
+  if [[ -L "$CURRENT_LINK" ]]; then
+    local target version
+    target="$(readlink "$CURRENT_LINK")"
+    version="${target##*/}"
+    if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && version_codex_path "$version" >/dev/null 2>&1; then
+      printf '%s\n' "$version"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+managed_link_or_absent() {
+  local link_path="$1" expected_target="$2" label="$3"
+  if [[ ! -e "$link_path" && ! -L "$link_path" ]]; then return 0; fi
+  if [[ -L "$link_path" ]]; then
+    local raw actual expected
+    raw="$(readlink "$link_path" 2>/dev/null || true)"
+    actual="$(readlink -f "$link_path" 2>/dev/null || true)"
+    expected="$(readlink -f "$expected_target" 2>/dev/null || true)"
+    if [[ -n "$actual" && -n "$expected" && "$actual" == "$expected" ]]; then return 0; fi
+    # Broken links into codex-tool/current are considered manager-owned, useful after HOME migration.
+    if [[ "$label" == "codex command" && "$raw" == *"/scripts/codex-tool/current/"* ]]; then return 0; fi
+    if [[ "$label" == "codex-tool command" && "$raw" == *"/scripts/codex-tool/codex-tool" ]]; then return 0; fi
+  fi
+  die "$label already exists and is not managed by codex-tool: $link_path"
+}
+
+ensure_command_links() {
+  managed_link_or_absent "$TOOL_COMMAND" "$SELF_PATH" "codex-tool command"
+  ln -sfn -- "$SELF_PATH" "$TOOL_COMMAND"
+
+  local cv codex_path
+  cv="$(current_version 2>/dev/null || true)"
+  if [[ -n "$cv" ]]; then
+    codex_path="$(version_codex_path "$cv")"
+    local relative
+    if [[ "$codex_path" == */bin/codex ]]; then relative="$CURRENT_LINK/bin/codex"; else relative="$CURRENT_LINK/codex"; fi
+    managed_link_or_absent "$CODEX_COMMAND" "$relative" "codex command"
+    ln -sfn -- "$relative" "$CODEX_COMMAND"
+  fi
+}
+
+switch_version() {
+  local version="$1"
+  validate_version "$version"
+  version_codex_path "$version" >/dev/null || die "version $version is not installed"
+  local layout
+  layout="$(version_layout "$version")"
+  if [[ "$layout" != "package" ]]; then
+    warn "Codex $version uses $layout layout; modern features such as code-mode host may be unavailable. Re-run 'codex-tool install $version' to repair it."
+  fi
+  local tmp_link="$TOOL_HOME/.current.$$.tmp"
+  rm -f -- "$tmp_link"
+  ln -s -- "versions/$version" "$tmp_link"
+  mv -Tf -- "$tmp_link" "$CURRENT_LINK"
+  ensure_command_links
+  log "active Codex version: $version"
+}
+
+parse_latest_version() {
+  local json_file="$1"
+  python3 - "$json_file" <<'PY'
+import json, re, sys
+with open(sys.argv[1], encoding='utf-8') as f: r=json.load(f)
+tag=r.get('tag_name','')
+m=re.fullmatch(r'rust-v((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))', tag)
+if not m or r.get('draft') or r.get('prerelease'):
+    raise SystemExit(f"unexpected latest release metadata: tag={tag!r}")
+print(m.group(1))
+PY
+}
+
+parse_release_assets() {
+  local json_file="$1" expected_version="$2"
+  python3 - "$json_file" "$expected_version" "$PACKAGE_ASSET" "$CHECKSUM_ASSET" <<'PY'
+import json,re,sys
+path,version,pkg_name,sum_name=sys.argv[1:]
+with open(path,encoding='utf-8') as f:r=json.load(f)
+if r.get('tag_name') != f'rust-v{version}': raise SystemExit('release tag mismatch')
+if r.get('draft') or r.get('prerelease'): raise SystemExit('refusing draft/prerelease')
+assets={a.get('name'):a for a in r.get('assets',[]) if isinstance(a,dict)}
+def one(name):
+    a=assets.get(name)
+    if not a: raise SystemExit(f'release asset not found: {name}')
+    url=a.get('browser_download_url',''); dig=a.get('digest','')
+    if not url.startswith('https://github.com/openai/codex/releases/download/'):
+        raise SystemExit(f'unexpected asset URL for {name}: {url!r}')
+    if not re.fullmatch(r'sha256:[0-9a-fA-F]{64}',dig):
+        raise SystemExit(f'{name} has no valid GitHub SHA-256 digest')
+    return url,dig.split(':',1)[1].lower()
+for name in (pkg_name,sum_name):
+    url,dig=one(name); print(url); print(dig)
+PY
+}
+
+small_download() {
+  local url="$1" dest="$2"
+  curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+    --connect-timeout "$CONNECT_TIMEOUT" --max-time "$API_TIMEOUT" \
+    --retry 3 --retry-delay 2 --retry-all-errors \
+    -H 'User-Agent: codex-tool' "$url" -o "$dest"
+}
+
+human_size() {
+  python3 - "$1" <<'PY'
+import sys
+n=int(sys.argv[1]); units=['B','KiB','MiB','GiB']; i=0
+while n>=1024 and i<len(units)-1: n/=1024; i+=1
+print(f'{n:.1f} {units[i]}')
+PY
+}
+
+resumable_download() {
+  local url="$1" dest="$2" label="$3"
+  mkdir -p -- "$(dirname "$dest")"
+  local attempt=0 max_attempts=$((DOWNLOAD_RETRIES + 1)) range_restart_done=0
+  while (( attempt < max_attempts )); do
+    attempt=$((attempt + 1))
+    local have=0
+    [[ -f "$dest" ]] && have="$(stat -c '%s' "$dest" 2>/dev/null || echo 0)"
+    if (( have > 0 )); then
+      log "resuming $label from $(human_size "$have") (attempt $attempt/$max_attempts)"
+    else
+      log "downloading $label (attempt $attempt/$max_attempts)"
+    fi
+
+    local -a args=(
+      --proto '=https' --tlsv1.2 --fail --show-error --location
+      --connect-timeout "$CONNECT_TIMEOUT" --max-time "$DOWNLOAD_MAX_TIME"
+      --retry 0 --continue-at - -H 'User-Agent: codex-tool'
+      -o "$dest"
+    )
+    if (( DOWNLOAD_STALL_TIME > 0 )); then
+      args+=( --speed-limit 1 --speed-time "$DOWNLOAD_STALL_TIME" )
+    fi
+
+    local err="$WORK_DIR/download.$$.stderr" rc
+    set +e
+    curl "${args[@]}" "$url" 2> >(tee "$err" >&2)
+    rc=$?
+    set -e
+    if (( rc == 0 )); then return 0; fi
+
+    local now=0
+    [[ -f "$dest" ]] && now="$(stat -c '%s' "$dest" 2>/dev/null || echo 0)"
+    warn "$label transfer interrupted (curl exit $rc); preserved $(human_size "$now") for resume."
+
+    # curl 33 is CURLE_RANGE_ERROR. Some servers answer a resumed request without range support.
+    if (( have > 0 && rc == 33 && range_restart_done == 0 )); then
+      warn "server rejected byte-range resume; restarting this file once from byte 0."
+      rm -f -- "$dest"
+      range_restart_done=1
+      continue
+    fi
+
+    (( attempt < max_attempts )) || break
+    sleep "$DOWNLOAD_RETRY_DELAY"
+  done
+  return 1
+}
+
+verify_sha256() {
+  local file="$1" expected="$2" label="$3" actual
+  actual="$(sha256sum "$file" | awk '{print tolower($1)}')"
+  [[ "$actual" == "$expected" ]] || die "$label SHA-256 mismatch (expected $expected, got $actual)"
+}
+
+checksum_entry() {
+  local manifest="$1" asset="$2"
+  awk -v asset="$asset" '$2 == asset && length($1)==64 && $1 !~ /[^0-9A-Fa-f]/ {print tolower($1); found=1; exit} END{if(!found) exit 1}' "$manifest"
+}
+
+validate_tar_safety() {
+  local archive="$1"
+  python3 - "$archive" <<'PY'
+import posixpath,sys,tarfile
+p=sys.argv[1]
+with tarfile.open(p,'r:gz') as t:
+    members=t.getmembers()
+    if not members: raise SystemExit('archive is empty')
+    for m in members:
+        n=m.name
+        norm=posixpath.normpath(n)
+        if n.startswith('/') or norm == '..' or norm.startswith('../'):
+            raise SystemExit(f'unsafe archive path: {n!r}')
+        if m.ischr() or m.isblk() or m.isfifo():
+            raise SystemExit(f'unsupported special file in archive: {n!r}')
+        if m.issym() or m.islnk():
+            target=m.linkname
+            if target.startswith('/'):
+                raise SystemExit(f'unsafe absolute link target: {target!r}')
+            base=posixpath.dirname(norm)
+            resolved=posixpath.normpath(posixpath.join(base,target))
+            if resolved == '..' or resolved.startswith('../'):
+                raise SystemExit(f'unsafe link target: {target!r}')
+PY
+}
+
+verify_binary_version() {
+  local binary="$1" expected="$2"
+  make_work_dir
+  local iso="$WORK_DIR/verify-home"
+  mkdir -p "$iso/home" "$iso/codex" "$iso/config" "$iso/cache" "$iso/data" "$iso/state"
+  local output rc
+  set +e
+  output="$(HOME="$iso/home" CODEX_HOME="$iso/codex" XDG_CONFIG_HOME="$iso/config" XDG_CACHE_HOME="$iso/cache" XDG_DATA_HOME="$iso/data" XDG_STATE_HOME="$iso/state" "$binary" --version 2>&1)"
+  rc=$?
+  set -e
+  (( rc == 0 )) || die "downloaded Codex failed version check: $output"
+  python3 - "$expected" "$output" <<'PY'
+import re,sys
+expected,output=sys.argv[1:]
+versions=re.findall(r'(?<![0-9])([0-9]+\.[0-9]+\.[0-9]+)(?![0-9])',output)
+if expected not in versions: raise SystemExit(f'binary version mismatch: expected {expected}, output={output!r}')
+PY
+}
+
+install_version() {
+  local version="$1"
+  validate_version "$version"
+  local existing_layout
+  existing_layout="$(version_layout "$version")"
+  if [[ "$existing_layout" == "package" ]]; then
+    log "Codex $version is already installed as a complete package"
+    switch_version "$version"
+    prune_history
+    return 0
+  elif [[ "$existing_layout" != "incomplete" ]]; then
+    warn "Codex $version is present in $existing_layout layout; reinstalling from GitHub to repair modern runtime components."
+  elif [[ -e "$VERSIONS_DIR/$version" ]]; then
+    warn "Codex $version installation is incomplete; reinstalling it."
+  fi
+
+  make_work_dir
+  local release_json="$WORK_DIR/release.json"
+  log "resolving GitHub release rust-v$version"
+  github_api_get "$API_BASE/releases/tags/rust-v$version" "$release_json" "Codex release rust-v$version" \
+    || die "unable to fetch release rust-v$version"
+
+  local parsed pkg_url pkg_api_sha sums_url sums_api_sha
+  parsed="$(parse_release_assets "$release_json" "$version")" || die "release metadata validation failed for $version"
+  pkg_url="$(sed -n '1p' <<<"$parsed")"
+  pkg_api_sha="$(sed -n '2p' <<<"$parsed")"
+  sums_url="$(sed -n '3p' <<<"$parsed")"
+  sums_api_sha="$(sed -n '4p' <<<"$parsed")"
+
+  local cache_dir="$DOWNLOADS_DIR/rust-v$version"
+  local archive="$cache_dir/$PACKAGE_ASSET.part"
+  local sums="$WORK_DIR/$CHECKSUM_ASSET"
+
+  log "downloading checksum manifest"
+  small_download "$sums_url" "$sums" || die "unable to download $CHECKSUM_ASSET"
+  verify_sha256 "$sums" "$sums_api_sha" "$CHECKSUM_ASSET"
+  local manifest_sha
+  manifest_sha="$(checksum_entry "$sums" "$PACKAGE_ASSET")" || die "unable to find $PACKAGE_ASSET in $CHECKSUM_ASSET"
+  [[ "$manifest_sha" == "$pkg_api_sha" ]] || die "GitHub package digest and checksum manifest disagree"
+
+  resumable_download "$pkg_url" "$archive" "$PACKAGE_ASSET" || die "download failed after all retry attempts; partial file retained at $archive"
+  local actual_sha
+  actual_sha="$(sha256sum "$archive" | awk '{print tolower($1)}')"
+  if [[ "$actual_sha" != "$pkg_api_sha" ]]; then
+    warn "downloaded package SHA-256 mismatch; removing corrupted partial file so the next run starts cleanly."
+    rm -f -- "$archive"
+    die "package SHA-256 mismatch (expected $pkg_api_sha, got $actual_sha)"
+  fi
+  log "SHA-256 verified: $actual_sha"
+
+  validate_tar_safety "$archive" || die "package archive safety validation failed"
+  local stage="$VERSIONS_DIR/.$version.new.$$"
+  rm -rf -- "$stage"
+  mkdir -p -- "$stage"
+  tar -xzf "$archive" -C "$stage" --no-same-owner --no-same-permissions
+
+  is_complete_package_dir "$stage" || { rm -rf -- "$stage"; die "downloaded Codex package is missing required runtime files"; }
+  chmod 0755 "$stage/bin/codex" "$stage/bin/codex-code-mode-host" "$stage/codex-path/rg"
+  [[ ! -f "$stage/codex-resources/bwrap" ]] || chmod 0755 "$stage/codex-resources/bwrap"
+  [[ ! -f "$stage/bin/codex-responses-api-proxy" ]] || chmod 0755 "$stage/bin/codex-responses-api-proxy"
+  ln -sfn "bin/codex" "$stage/codex"
+  verify_binary_version "$stage/bin/codex" "$version"
+
+  cat > "$stage/codex-tool-manifest" <<MANIFEST
+codex-tool-version=$TOOL_VERSION
+version=$version
+tag=rust-v$version
+target=$TARGET
+asset=$PACKAGE_ASSET
+sha256=$actual_sha
+installed_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+MANIFEST
+
+  rm -rf -- "$VERSIONS_DIR/$version"
+  mv -- "$stage" "$VERSIONS_DIR/$version"
+  rm -rf -- "$cache_dir"
+  log "installed Codex $version"
+  switch_version "$version"
+  prune_history
+}
+
+latest_stable_version() {
+  make_work_dir
+  local json="$WORK_DIR/latest.json"
+  log "checking the latest stable GitHub release" >&2
+  github_api_get "$API_BASE/releases/latest" "$json" "latest Codex release" \
+    || die "unable to query the latest stable release"
+  parse_latest_version "$json" || die "unable to parse latest stable release version"
+}
+
+prune_history() {
+  validate_uint CODEX_TOOL_HISTORY_KEEP "$HISTORY_KEEP"
+  local current
+  current="$(current_version 2>/dev/null || true)"
+  mapfile -t all < <(find "$VERSIONS_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -Vr || true)
+  local kept=0 v
+  for v in "${all[@]}"; do
+    [[ "$v" == "$current" ]] && continue
+    if (( kept < HISTORY_KEEP )); then
+      kept=$((kept+1))
+    else
+      log "removing old Codex version: $v"
+      rm -rf -- "$VERSIONS_DIR/$v"
+    fi
+  done
+}
+
+list_versions() {
+  local current
+  current="$(current_version 2>/dev/null || true)"
+  if [[ -n "$current" ]]; then printf 'Current: %s\n\n' "$current"; else printf 'Current: (none)\n\n'; fi
+  printf 'Installed locally:\n'
+  local found=0 v layout marker
+  while IFS= read -r v; do
+    [[ -n "$v" ]] || continue
+    found=1; layout="$(version_layout "$v")"; marker=" "
+    [[ "$v" == "$current" ]] && marker="*"
+    if [[ "$v" == "$current" ]]; then
+      printf '  %s %s [current, %s]\n' "$marker" "$v" "$layout"
+    else
+      printf '  %s %s [%s]\n' "$marker" "$v" "$layout"
+    fi
+  done < <(find "$VERSIONS_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -Vr || true)
+  (( found )) || printf '  (none)\n'
+  printf '\nNote: list is local-only and never queries GitHub.\n'
+}
+
+delete_version() {
+  local version="$1"; validate_version "$version"
+  [[ -d "$VERSIONS_DIR/$version" ]] || die "version $version is not installed"
+  local current="$(current_version 2>/dev/null || true)"
+  [[ "$version" != "$current" ]] || die "cannot delete the active version $version; switch first"
+  rm -rf -- "$VERSIONS_DIR/$version" "$DOWNLOADS_DIR/rust-v$version"
+  log "deleted Codex $version"
+}
+
+confirm_or_die() {
+  local yes="$1" prompt="$2"
+  [[ "$yes" == "1" ]] && return 0
+  [[ -t 0 ]] || die "confirmation required; re-run with --yes"
+  printf '%s [y/N] ' "$prompt"
+  local ans; read -r ans
+  [[ "$ans" =~ ^[Yy]([Ee][Ss])?$ ]] || die "cancelled"
+}
+
+clean_data() {
+  local yes="$1"
+  confirm_or_die "$yes" "Delete all data under $CODEX_DATA_DIR except config.toml and auth.json?"
+  [[ -d "$CODEX_DATA_DIR" ]] || { log "Codex data directory does not exist; nothing to clean"; return; }
+  make_work_dir
+  local keep="$WORK_DIR/keep"; mkdir -p "$keep"
+  [[ ! -f "$CODEX_DATA_DIR/config.toml" ]] || cp -p -- "$CODEX_DATA_DIR/config.toml" "$keep/config.toml"
+  [[ ! -f "$CODEX_DATA_DIR/auth.json" ]] || cp -p -- "$CODEX_DATA_DIR/auth.json" "$keep/auth.json"
+  find "$CODEX_DATA_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+  [[ ! -f "$keep/config.toml" ]] || cp -p -- "$keep/config.toml" "$CODEX_DATA_DIR/config.toml"
+  [[ ! -f "$keep/auth.json" ]] || cp -p -- "$keep/auth.json" "$CODEX_DATA_DIR/auth.json"
+  log "cleaned Codex data; preserved config.toml and auth.json when present"
+}
+
+prune_all() {
+  local yes="$1" force="$2"
+  # Validate the public command path before deleting anything.
+  if [[ -e "$CODEX_COMMAND" && ! -L "$CODEX_COMMAND" ]]; then
+    if [[ -f "$CODEX_COMMAND" ]]; then
+      (( force )) || die "$CODEX_COMMAND is a regular file, not a symlink; use 'prune --force' only if it should be removed"
+    else
+      die "$CODEX_COMMAND is not a symlink or regular file; refusing to remove it"
+    fi
+  fi
+  confirm_or_die "$yes" "Remove all codex-tool managed Codex versions, download cache, current link, and $CODEX_COMMAND?"
+  if [[ -L "$CODEX_COMMAND" || ( -f "$CODEX_COMMAND" && "$force" == "1" ) ]]; then rm -f -- "$CODEX_COMMAND"; fi
+  rm -f -- "$CURRENT_LINK"
+  rm -rf -- "$VERSIONS_DIR" "$DOWNLOADS_DIR"
+  mkdir -p -- "$VERSIONS_DIR" "$DOWNLOADS_DIR"
+  log "pruned all managed Codex versions and download cache; codex-tool and Codex user data were preserved"
+}
+
+main() {
+  ensure_supported_platform
+  need_cmd curl; need_cmd python3; need_cmd tar; need_cmd sha256sum; need_cmd find; need_cmd sort; need_cmd stat
+  validate_uint CODEX_TOOL_API_TIMEOUT "$API_TIMEOUT"
+  validate_uint CODEX_TOOL_CONNECT_TIMEOUT "$CONNECT_TIMEOUT"
+  validate_uint CODEX_TOOL_DOWNLOAD_RETRIES "$DOWNLOAD_RETRIES"
+  validate_uint CODEX_TOOL_DOWNLOAD_RETRY_DELAY "$DOWNLOAD_RETRY_DELAY"
+  validate_uint CODEX_TOOL_DOWNLOAD_STALL_TIME "$DOWNLOAD_STALL_TIME"
+  validate_uint CODEX_TOOL_DOWNLOAD_MAX_TIME "$DOWNLOAD_MAX_TIME"
+  ensure_layout
+  lock_manager
+  ensure_command_links
+
+  local cmd="${1:-help}"
+  case "$cmd" in
+    install)
+      [[ $# -eq 2 ]] || die "usage: codex-tool install X.Y.Z"
+      install_version "$2" ;;
+    update)
+      [[ $# -eq 1 ]] || die "usage: codex-tool update"
+      local latest; latest="$(latest_stable_version)"
+      log "latest stable Codex version: $latest"
+      install_version "$latest" ;;
+    delete)
+      [[ $# -eq 2 ]] || die "usage: codex-tool delete X.Y.Z"
+      delete_version "$2" ;;
+    switch)
+      [[ $# -eq 2 ]] || die "usage: codex-tool switch X.Y.Z"
+      switch_version "$2" ;;
+    list)
+      [[ $# -eq 1 ]] || die "usage: codex-tool list"
+      list_versions ;;
+    clean)
+      local yes=0; shift
+      while (($#)); do case "$1" in --yes|-y) yes=1;; *) die "unknown clean option: $1";; esac; shift; done
+      clean_data "$yes" ;;
+    prune)
+      local yes=0 force=0; shift
+      while (($#)); do case "$1" in --yes|-y) yes=1;; --force) force=1;; *) die "unknown prune option: $1";; esac; shift; done
+      prune_all "$yes" "$force" ;;
+    version|--version|-V)
+      printf 'codex-tool %s\n' "$TOOL_VERSION" ;;
+    help|-h|--help)
+      usage ;;
+    *) die "unknown command: $cmd (run 'codex-tool help')" ;;
+  esac
+}
+
+main "$@"

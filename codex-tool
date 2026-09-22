@@ -395,7 +395,7 @@ PY
 small_download() {
   local url="$1" dest="$2" label="${3:-download}"
   local attempt=0 max_attempts=$((DOWNLOAD_RETRIES + 1))
-  local err="$WORK_DIR/small-download.$.stderr" rc
+  local err="$WORK_DIR/small-download.$$.stderr" rc
 
   # Keep retry behavior independent of curl --retry-all-errors, which is only
   # available in curl 7.71.0 and newer. Older enterprise distributions can

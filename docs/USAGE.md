@@ -1,4 +1,4 @@
-# codex-tool 1.5.0 — Usage Guide
+# codex-tool 1.5.1 — Usage Guide
 
 A lightweight version manager for the OpenAI Codex CLI standalone Linux x86_64 package.
 
@@ -8,6 +8,7 @@ A lightweight version manager for the OpenAI Codex CLI standalone Linux x86_64 p
 - Keeps Codex versions under `~/scripts/codex-tool/versions/` and user data under `~/.codex` untouched during install/update/switch.
 - `list` is local-only and never queries GitHub.
 - Large release downloads use persistent `.part` files, unlimited total transfer time by default, retry/resume, and SHA-256 verification.
+- Small checksum downloads use script-level retries and do not require curl `--retry-all-errors`, improving compatibility with curl versions older than 7.71.0.
 - GitHub API calls normally honor the user's existing proxy configuration. If GitHub returns a rate-limit `403`, codex-tool explains the condition and retries that API request once with proxy use disabled (`--proxy '' --noproxy '*'`). This fallback is limited to GitHub API metadata requests; release asset downloads continue to use the user's normal network/proxy settings.
 
 ## Install / overwrite manager
@@ -65,3 +66,16 @@ CODEX_TOOL_DOWNLOAD_MAX_TIME=0
 ```
 
 `CODEX_TOOL_DOWNLOAD_MAX_TIME=0` means no total-time limit for each large-file transfer attempt.
+
+
+## Older curl compatibility
+
+`codex-tool` does not require the curl `--retry-all-errors` option. This option was added in curl 7.71.0 and is absent from some older enterprise Linux distributions.
+
+Checksum-manifest downloads are retried by the shell wrapper instead, so older curl builds can still install Codex without upgrading the system curl package.
+
+To inspect the installed curl version:
+
+```bash
+curl --version
+```

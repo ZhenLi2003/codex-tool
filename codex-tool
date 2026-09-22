@@ -25,6 +25,7 @@ DOWNLOAD_STALL_TIME="${CODEX_TOOL_DOWNLOAD_STALL_TIME:-180}"
 DOWNLOAD_MAX_TIME="${CODEX_TOOL_DOWNLOAD_MAX_TIME:-0}"
 SELF_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 WORK_DIR=""
+CURL_TLS_ARGS=()
 
 log()  { printf '==> %s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
@@ -76,6 +77,19 @@ USAGE
 }
 
 need_cmd() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"; }
+
+init_curl_compat() {
+  # --proto is retained as a security requirement (available since curl 7.20.2).
+  curl --proto '=https' --version >/dev/null 2>&1 \
+    || die "curl is too old: codex-tool requires support for --proto (curl >= 7.20.2)"
+
+  CURL_TLS_ARGS=()
+  if curl --tlsv1.2 --version >/dev/null 2>&1; then
+    CURL_TLS_ARGS+=( --tlsv1.2 )
+  else
+    warn "this curl does not support --tlsv1.2 (added in curl 7.34.0); continuing without the explicit TLS-minimum option."
+  fi
+}
 
 validate_uint() {
   local name="$1" value="$2"
@@ -156,7 +170,7 @@ github_api_once() {
   local url="$1" body="$2" headers="$3" stderr_file="$4" mode="$5"
   local -a args=(
     --proto '=https'
-    --tlsv1.2
+    "${CURL_TLS_ARGS[@]}"
     --silent
     --show-error
     --location
@@ -391,7 +405,7 @@ small_download() {
     rm -f -- "$dest" "$err"
 
     set +e
-    curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+    curl --proto '=https' "${CURL_TLS_ARGS[@]}" --fail --silent --show-error --location \
       --connect-timeout "$CONNECT_TIMEOUT" --max-time "$API_TIMEOUT" \
       --retry 0 \
       -H 'User-Agent: codex-tool' "$url" -o "$dest" 2>"$err"
@@ -439,7 +453,7 @@ resumable_download() {
     fi
 
     local -a args=(
-      --proto '=https' --tlsv1.2 --fail --show-error --location
+      --proto '=https' "${CURL_TLS_ARGS[@]}" --fail --show-error --location
       --connect-timeout "$CONNECT_TIMEOUT" --max-time "$DOWNLOAD_MAX_TIME"
       --retry 0 --continue-at - -H 'User-Agent: codex-tool'
       -o "$dest"
@@ -709,6 +723,7 @@ prune_all() {
 main() {
   ensure_supported_platform
   need_cmd curl; need_cmd python3; need_cmd tar; need_cmd sha256sum; need_cmd find; need_cmd sort; need_cmd stat
+  init_curl_compat
   validate_uint CODEX_TOOL_API_TIMEOUT "$API_TIMEOUT"
   validate_uint CODEX_TOOL_CONNECT_TIMEOUT "$CONNECT_TIMEOUT"
   validate_uint CODEX_TOOL_DOWNLOAD_RETRIES "$DOWNLOAD_RETRIES"

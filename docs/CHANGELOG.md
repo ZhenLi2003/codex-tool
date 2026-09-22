@@ -2,6 +2,13 @@
 
 This file summarizes the major iterations of `codex-tool`.
 
+## 1.5.1
+
+- Removed the hard dependency on curl `--retry-all-errors`.
+- Added shell-level retries for small checksum-manifest downloads.
+- Restored compatibility with older curl builds, including versions before 7.71.0 commonly found on older enterprise Linux systems.
+- Kept retry behavior and SHA-256 verification unchanged from the user's perspective.
+
 ## 1.5.0
 
 - Added GitHub API rate-limit diagnostics.

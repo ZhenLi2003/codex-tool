@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 022
 
-TOOL_VERSION="1.5.0"
+TOOL_VERSION="1.5.1"
 TOOL_HOME="${CODEX_TOOL_HOME:-$HOME/scripts/codex-tool}"
 VERSIONS_DIR="$TOOL_HOME/versions"
 DOWNLOADS_DIR="$TOOL_HOME/downloads"
@@ -379,11 +379,40 @@ PY
 }
 
 small_download() {
-  local url="$1" dest="$2"
-  curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
-    --connect-timeout "$CONNECT_TIMEOUT" --max-time "$API_TIMEOUT" \
-    --retry 3 --retry-delay 2 --retry-all-errors \
-    -H 'User-Agent: codex-tool' "$url" -o "$dest"
+  local url="$1" dest="$2" label="${3:-download}"
+  local attempt=0 max_attempts=$((DOWNLOAD_RETRIES + 1))
+  local err="$WORK_DIR/small-download.$.stderr" rc
+
+  # Keep retry behavior independent of curl --retry-all-errors, which is only
+  # available in curl 7.71.0 and newer. Older enterprise distributions can
+  # therefore still retry checksum/metadata asset downloads.
+  while (( attempt < max_attempts )); do
+    attempt=$((attempt + 1))
+    rm -f -- "$dest" "$err"
+
+    set +e
+    curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+      --connect-timeout "$CONNECT_TIMEOUT" --max-time "$API_TIMEOUT" \
+      --retry 0 \
+      -H 'User-Agent: codex-tool' "$url" -o "$dest" 2>"$err"
+    rc=$?
+    set -e
+
+    if (( rc == 0 )); then
+      rm -f -- "$err"
+      return 0
+    fi
+
+    rm -f -- "$dest"
+    warn "$label download failed (curl exit $rc, attempt $attempt/$max_attempts)."
+    if [[ -s "$err" ]]; then
+      warn "curl: $(tr '\n' ' ' < "$err" | sed 's/[[:space:]]\+/ /g' | cut -c1-500)"
+    fi
+    (( attempt < max_attempts )) || break
+    sleep "$DOWNLOAD_RETRY_DELAY"
+  done
+
+  return 1
 }
 
 human_size() {
@@ -534,7 +563,7 @@ install_version() {
   local sums="$WORK_DIR/$CHECKSUM_ASSET"
 
   log "downloading checksum manifest"
-  small_download "$sums_url" "$sums" || die "unable to download $CHECKSUM_ASSET"
+  small_download "$sums_url" "$sums" "$CHECKSUM_ASSET" || die "unable to download $CHECKSUM_ASSET"
   verify_sha256 "$sums" "$sums_api_sha" "$CHECKSUM_ASSET"
   local manifest_sha
   manifest_sha="$(checksum_entry "$sums" "$PACKAGE_ASSET")" || die "unable to find $PACKAGE_ASSET in $CHECKSUM_ASSET"

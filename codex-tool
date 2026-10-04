@@ -71,6 +71,7 @@ Usage:
   codex-tool install X.Y.Z          Install/repair and activate a stable version
   codex-tool update                 Install/activate the latest stable version
   codex-tool delete X.Y.Z           Delete an installed non-current version
+  codex-tool stop                   Stop the managed Codex app-server daemon
   codex-tool clean [--all] [--dry-run] [--yes]
                                     Delete persisted Codex sessions through the official
                                     app-server API. Default: inactive threads only.
@@ -83,6 +84,7 @@ Usage:
   codex-tool switch X.Y.Z           Safely activate an installed version with daemon
                                     stop/restore when a managed daemon is running
   codex-tool daemon status          Inspect managed app-server daemon state
+  codex-tool daemon stop            Alias of codex-tool stop
   codex-tool daemon repair [--yes]  Repair stale managed daemon runtime state
   codex-tool auth login             Save and verify a GitHub access token
   codex-tool auth status            Show which GitHub authentication source is active
@@ -907,6 +909,56 @@ stop_app_server_internal() {
 
   log "managed Codex app-server is stopped"
   return 0
+}
+
+guard_explicit_stop_against_manager_mutation() {
+  need_cmd flock
+  need_cmd stat
+
+  local lock_file holders pid
+  for lock_file in "$(manager_lock_root)/manager.lock" "$TOOL_HOME/.lock"; do
+    [[ -e "$lock_file" || -L "$lock_file" ]] || continue
+    manager_lock_is_free "$lock_file" && continue
+
+    holders="$(manager_lock_holder_pids "$lock_file" | sort -u)"
+    [[ -n "$holders" ]] || {
+      warn "manager lock is busy but its holder cannot be identified safely: $lock_file"
+      return 1
+    }
+
+    while IFS= read -r pid; do
+      [[ -n "$pid" ]] || continue
+      if is_codex_tool_manager_pid "$pid"; then
+        warn "another codex-tool mutation is currently running (PID $pid): $(process_cmdline "$pid")"
+        return 1
+      fi
+      if ! is_managed_daemon_pid "$pid"; then
+        warn "manager lock is held by an unknown process (PID $pid): $(process_cmdline "$pid")"
+        return 1
+      fi
+    done <<<"$holders"
+  done
+  return 0
+}
+
+stop_app_server_command() {
+  ensure_supported_platform
+  need_cmd python3
+  need_cmd stat
+  need_cmd flock
+
+  guard_explicit_stop_against_manager_mutation     || die "refusing to stop app-server while another manager mutation may be in progress"
+
+  stop_app_server_internal "explicit codex-tool stop"     || die "unable to stop managed Codex app-server safely"
+
+  local lock_file
+  for lock_file in "$(manager_lock_root)/manager.lock" "$TOOL_HOME/.lock"; do
+    [[ -e "$lock_file" || -L "$lock_file" ]] || continue
+    if manager_lock_is_free "$lock_file"; then
+      [[ "$(basename "$lock_file")" != "manager.lock" ]]         || rm -f -- "$(dirname "$lock_file")/manager.pid"
+      [[ "$lock_file" != "$TOOL_HOME/.lock" ]] || rm -f -- "$lock_file"
+    fi
+  done
 }
 
 daemon_stop_for_mutation() {
@@ -2213,45 +2265,51 @@ prune_all() {
     else
       log "dry run: inactive saved session history would be preserved"
     fi
-    log "dry run only; no threads, daemon state, or program files were modified"
+    log "dry run only; app-server was not stopped and no data was modified"
     return 0
   fi
 
   if (( purge_history )); then
-    confirm_or_die "$yes" "Delete ALL Codex sessions (including active/background threads), stop the daemon, and remove Codex program/runtime assets? User config/auth/skills/rules will be preserved."
+    confirm_or_die "$yes" "Delete ALL Codex sessions, stop app-server, and remove Codex program/runtime assets? User config/auth/skills/rules will be preserved."
   else
-    confirm_or_die "$yes" "Delete all loaded/background Codex threads, stop the daemon, and remove Codex program/runtime assets? Inactive saved history and user config/auth will be preserved."
-  fi
-
-  if (( purge_history )); then
-    log "purging all persisted Codex sessions before program removal"
-    clean_data 1 1 0 || {
-      warn "full session purge did not complete; prune aborted before program/runtime removal"
-      return 1
-    }
+    confirm_or_die "$yes" "Delete all loaded/background Codex threads, stop app-server, and remove Codex program/runtime assets? Inactive saved history and user config/auth will be preserved."
   fi
 
   make_work_dir
   local ids_file="$WORK_DIR/prune-background-threads.txt"
   : > "$ids_file"
 
-  # Even after --purge-history, rescan the daemon in case a transient/background
-  # thread appeared between the cleanup and the prune boundary.
-  session_admin_run prepare-prune 0 "$ids_file" auto || return 1
+  if [[ -n "$PRELOCK_LOADED_IDS_FILE" && -f "$PRELOCK_LOADED_IDS_FILE" ]]; then
+    if (( PRELOCK_LOADED_CAPTURE_FAILED )); then
+      warn "loaded-thread snapshot before legacy-lock recovery was incomplete; refusing prune."
+      return 1
+    fi
+    cp -- "$PRELOCK_LOADED_IDS_FILE" "$ids_file"
+    log "using loaded-thread snapshot captured before legacy daemon-lock recovery"
+  else
+    session_admin_run prepare-prune 0 "$ids_file" auto || return 1
+  fi
 
   daemon_snapshot
   local daemon_was_running=0
   [[ "$DAEMON_STATE" == "running" ]] && daemon_was_running=1
+  (( PRELOCK_DAEMON_WAS_RUNNING )) && daemon_was_running=1
 
   if ! daemon_stop_for_prune; then
     warn "unable to stop Codex background runtime safely; prune aborted before program removal"
     return 1
   fi
 
-  if ! session_admin_run delete-ids 0 "$ids_file" stdio; then
-    warn "background thread interruption succeeded, but persistent thread deletion was incomplete."
+  local session_rc=0
+  if (( purge_history )); then
+    session_admin_run clean-stopped 1 "" stdio || session_rc=$?
+  else
+    session_admin_run delete-ids 0 "$ids_file" stdio || session_rc=$?
+  fi
+
+  if (( session_rc != 0 )); then
+    warn "persistent thread cleanup was incomplete; prune aborted before program removal."
     if (( daemon_was_running )); then
-      daemon_snapshot
       DAEMON_WAS_RUNNING=1
       daemon_restore_after_mutation || true
     fi
@@ -2263,7 +2321,6 @@ prune_all() {
     warn "Codex process(es) appeared while prune was running:"
     printf '%s\n' "$foreground" >&2
     if (( daemon_was_running )); then
-      daemon_snapshot
       DAEMON_WAS_RUNNING=1
       daemon_restore_after_mutation || true
     fi
@@ -2277,11 +2334,9 @@ prune_all() {
   rm -rf -- "$VERSIONS_DIR" "$DOWNLOADS_DIR"
   mkdir -p -- "$VERSIONS_DIR" "$DOWNLOADS_DIR"
 
-  rm -rf -- \
-    "$CODEX_DATA_DIR/packages/app-server-daemon" \
-    "$CODEX_DATA_DIR/packages/standalone" \
-    "$CODEX_DATA_DIR/app-server-daemon" \
-    "$CODEX_DATA_DIR/app-server-control"
+  rm -rf --     "$CODEX_DATA_DIR/packages/app-server-daemon"     "$CODEX_DATA_DIR/packages/standalone"     "$CODEX_DATA_DIR/app-server-daemon"     "$CODEX_DATA_DIR/app-server-control"
+
+  PRELOCK_DAEMON_WAS_RUNNING=0
 
   if (( purge_history )); then
     log "pruned Codex program/runtime assets and purged persisted session history"
@@ -2582,6 +2637,13 @@ init_github_auth() {
   validate_uint CODEX_TOOL_CONNECT_TIMEOUT "$CONNECT_TIMEOUT"
 }
 
+init_session_readonly() {
+  ensure_supported_platform
+  need_cmd python3
+  need_cmd stat
+}
+
+
 main() {
   local cmd="${1:-help}"
 
@@ -2627,13 +2689,16 @@ main() {
       init_manager_mutation
       delete_version "$2"
       ;;
+    stop)
+      [[ $# -eq 1 ]] || die "usage: codex-tool stop"
+      stop_app_server_command
+      ;;
     switch)
       [[ $# -eq 2 ]] || die "usage: codex-tool switch X.Y.Z"
       init_manager_mutation
       switch_version "$2"
       ;;
     clean)
-      init_manager_mutation
       local yes=0 all_threads=0 dry_run=0
       shift
       while (($#)); do
@@ -2645,10 +2710,10 @@ main() {
         esac
         shift
       done
+      if (( dry_run )); then init_session_readonly; else init_manager_mutation; fi
       clean_data "$yes" "$all_threads" "$dry_run"
       ;;
     prune)
-      init_manager_mutation
       local yes=0 force=0 dry_run=0 purge_history=0
       shift
       while (($#)); do
@@ -2661,10 +2726,11 @@ main() {
         esac
         shift
       done
+      if (( dry_run )); then init_session_readonly; else init_manager_mutation; fi
       prune_all "$yes" "$force" "$dry_run" "$purge_history"
       ;;
     daemon)
-      [[ $# -ge 2 ]] || die "usage: codex-tool daemon {status|repair [--yes]}"
+      [[ $# -ge 2 ]] || die "usage: codex-tool daemon {status|stop|repair [--yes]}"
       case "$2" in
         status)
           [[ $# -eq 2 ]] || die "usage: codex-tool daemon status"
@@ -2672,6 +2738,10 @@ main() {
           need_cmd python3
           need_cmd stat
           daemon_status
+          ;;
+        stop)
+          [[ $# -eq 2 ]] || die "usage: codex-tool daemon stop"
+          stop_app_server_command
           ;;
         repair)
           init_manager_mutation
@@ -2687,7 +2757,7 @@ main() {
           daemon_repair "$yes"
           ;;
         *)
-          die "usage: codex-tool daemon {status|repair [--yes]}"
+          die "usage: codex-tool daemon {status|stop|repair [--yes]}"
           ;;
       esac
       ;;

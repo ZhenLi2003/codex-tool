@@ -11,7 +11,8 @@
 - **安装简单**：项目核心只有 `install.sh` 和 `codex-tool` 两个脚本。
 - **支持多版本切换**：可同时保留多个 Codex 版本，并快速切换当前版本。
 - **安装完整运行时**：使用完整 Codex package，包括 `codex-code-mode-host` 等现代组件。
-- **保留用户数据**：`~/.codex` 与程序版本分离，切换和升级不会清空用户配置。
+- **感知后台 daemon 生命周期**：版本激活时安全停止/恢复 managed app-server，`clean` 不再删除 daemon 状态或 package。
+- **保留用户数据**：`~/.codex` 中的配置、认证、daemon package 以及未来未知状态默认保留。
 - **适合不稳定网络**：大文件支持断点续传、自动重试和 SHA-256 校验。
 - **自动处理 GitHub API 限流场景**：如果共享代理出口耗尽匿名 API 配额，工具会先尝试直连；若直连不可用，则在交互终端中引导创建 GitHub access token，隐藏输入并验证后，以 `0600` 权限保存，后续 API 请求自动复用。
 
@@ -92,10 +93,12 @@ codex-tool update                 安装并激活最新稳定版本
 codex-tool list                   查看当前版本和本地已安装版本
 codex-tool switch X.Y.Z           切换到已安装版本
 codex-tool delete X.Y.Z           删除非当前版本
-codex-tool clean [--yes]          清理 Codex 数据，但保留 config.toml 和 auth.json
+codex-tool clean [--yes]          仅清理已知历史/日志数据；保留配置、认证、daemon 状态/package
 codex-tool prune [--yes] [--force]
-                                  删除所有受管理的 Codex 版本、下载缓存和 codex 命令链接
+                                  按需停止 managed daemon，再删除 codex-tool 管理的版本、缓存和 codex 链接
 codex-tool version                查看 codex-tool 版本
+codex-tool daemon status          查看 app-server daemon 状态
+codex-tool daemon repair [--yes]  修复 stale managed daemon 运行时状态
 codex-tool auth login             保存并验证 GitHub access token
 codex-tool auth status            查看当前 GitHub 认证来源
 codex-tool auth logout            删除 codex-tool 保存的 token
@@ -159,6 +162,26 @@ Codex 用户配置和运行数据仍保存在：
 ```
 
 升级管理器、安装新版本或切换版本都不会自动清空该目录。
+
+## Daemon-aware 生命周期
+
+新版 Codex 会在 `CODEX_HOME` 下维护 managed app-server daemon。codex-tool 1.7.0 将其作为独立生命周期组件处理：
+
+- `install` / `update` / `switch` 在下载和校验完成后，只有进入真正的版本激活事务时才停止健康的 managed daemon，并在切换后恢复。
+- 如果 daemon 恢复失败，新 CLI 仍保持激活，旧版本不会被自动清理，便于后续恢复。
+- `prune` 会停止 managed daemon 并故意保持 stopped，但不会删除 `CODEX_HOME/packages/app-server-daemon`、daemon 设置或用户数据。
+- `clean` 改为删除 allowlist，只清理 `sessions/`、`archived_sessions/`、`history.jsonl`、`log/`。
+- `clean` 不再“删除整个 `CODEX_HOME` 后恢复两个文件”，因此 `config.toml`、`auth.json`、daemon 状态、packages 以及未来未知目录都会保留。
+- 如果某个受管理版本仍被前台 Codex 进程引用，`delete`、自动历史清理、同版本替换及 `prune` 都不会删除它。
+
+诊断与修复：
+
+```bash
+codex-tool daemon status
+codex-tool daemon repair
+```
+
+当 daemon 状态为 stale/unknown，或者发现 unmanaged app-server 时，普通变更命令会 fail closed；只有显式的 `daemon repair` 才进入 stale managed daemon 的恢复流程。
 
 ## GitHub API 认证与限流恢复
 

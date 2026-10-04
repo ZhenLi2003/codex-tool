@@ -1302,7 +1302,7 @@ class Client:
             "clientInfo": {
                 "name": "codex-tool",
                 "title": "codex-tool session manager",
-                "version": "1.8.0",
+                "version": "1.8.1",
             },
             "capabilities": {"experimentalApi": True},
         }, timeout=15)

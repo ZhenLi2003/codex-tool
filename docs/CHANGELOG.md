@@ -2,6 +2,19 @@
 
 This file summarizes the major iterations of `codex-tool`.
 
+## 1.7.1
+
+- Fixed a startup design issue where every command acquired the same exclusive `flock` before command dispatch.
+- Read-only commands (`version`, `help`, `list`, `auth status`, `daemon status`) no longer acquire the manager mutation lock.
+- `version` and `help` no longer perform unrelated network/download dependency checks.
+- Moved the manager lock from `TOOL_HOME/.lock` to a host-local runtime directory: `$XDG_RUNTIME_DIR/codex-tool` or `/tmp/codex-tool-$UID`.
+- Added user-ownership and mode-0700 validation for the runtime lock directory.
+- Added `CODEX_TOOL_LOCK_TIMEOUT` with a default of 10 seconds.
+- Lock contention now fails with a clear error instead of waiting indefinitely.
+- Added a best-effort holder PID/command diagnostic for lock contention.
+- Preserved the 1.7.0 daemon-aware lifecycle behavior for all mutation commands.
+
+
 ## 1.7.0
 
 - Reworked Codex mutations around the modern managed app-server daemon lifecycle.

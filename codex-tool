@@ -209,7 +209,7 @@ save_github_token() {
   dir="$(dirname "$GITHUB_TOKEN_FILE")"
   mkdir -p -- "$dir"
   chmod 0700 -- "$dir" 2>/dev/null || true
-  tmp="$GITHUB_TOKEN_FILE.tmp.$"
+  tmp="$GITHUB_TOKEN_FILE.tmp.$$"
   ( umask 077; printf '%s\n' "$token" > "$tmp" )
   chmod 0600 -- "$tmp"
   mv -f -- "$tmp" "$GITHUB_TOKEN_FILE"
@@ -252,9 +252,9 @@ prompt_github_token_and_retry() {
   [[ -n "$token" ]] || { warn "GitHub token entry cancelled."; return 1; }
   validate_github_token_text "$token" || { warn "token contains whitespace and was rejected."; return 1; }
 
-  local body="$WORK_DIR/api-token.$.json"
-  local headers="$WORK_DIR/api-token.$.headers"
-  local err="$WORK_DIR/api-token.$.stderr"
+  local body="$WORK_DIR/api-token.$$.json"
+  local headers="$WORK_DIR/api-token.$$.headers"
+  local err="$WORK_DIR/api-token.$$.stderr"
   local result rc status msg
   result="$(github_api_once "$url" "$body" "$headers" "$err" normal "$token")"
   rc="$(sed -n '1p' <<<"$result")"

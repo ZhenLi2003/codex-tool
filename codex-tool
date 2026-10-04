@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 022
 
-TOOL_VERSION="1.5.1"
+TOOL_VERSION="1.6.0"
 TOOL_HOME="${CODEX_TOOL_HOME:-$HOME/scripts/codex-tool}"
 VERSIONS_DIR="$TOOL_HOME/versions"
 DOWNLOADS_DIR="$TOOL_HOME/downloads"
@@ -23,6 +23,9 @@ DOWNLOAD_RETRIES="${CODEX_TOOL_DOWNLOAD_RETRIES:-8}"
 DOWNLOAD_RETRY_DELAY="${CODEX_TOOL_DOWNLOAD_RETRY_DELAY:-5}"
 DOWNLOAD_STALL_TIME="${CODEX_TOOL_DOWNLOAD_STALL_TIME:-180}"
 DOWNLOAD_MAX_TIME="${CODEX_TOOL_DOWNLOAD_MAX_TIME:-0}"
+CONFIG_DIR="${CODEX_TOOL_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/codex-tool}"
+GITHUB_TOKEN_FILE="${CODEX_TOOL_GITHUB_TOKEN_FILE:-$CONFIG_DIR/github-token}"
+GITHUB_TOKEN_URL="https://github.com/settings/tokens/new"
 SELF_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 WORK_DIR=""
 CURL_TLS_ARGS=()
@@ -51,6 +54,9 @@ Usage:
                                     and ~/.codex data
   codex-tool list                   Show current and locally installed versions only
   codex-tool switch X.Y.Z           Activate an already installed version
+  codex-tool auth login             Save and verify a GitHub access token
+  codex-tool auth status            Show which GitHub authentication source is active
+  codex-tool auth logout            Remove the token saved by codex-tool
   codex-tool version                Show codex-tool version
   codex-tool help
 
@@ -60,6 +66,7 @@ Environment:
   CODEX_TOOL_HOME=PATH              Manager directory (default: ~/scripts/codex-tool)
   CODEX_TOOL_BIN_DIR=PATH           Command-link directory (default: ~/.local/bin)
   CODEX_HOME=PATH                   Codex data directory (default: ~/.codex)
+  CODEX_TOOL_GITHUB_TOKEN_FILE=PATH  Saved GitHub token file
   CODEX_TOOL_API_TIMEOUT=N          GitHub API max time in seconds (default: 120)
   CODEX_TOOL_CONNECT_TIMEOUT=N      Connection timeout in seconds (default: 30)
   CODEX_TOOL_DOWNLOAD_RETRIES=N     Retries after first large download attempt (default: 8)
@@ -68,11 +75,13 @@ Environment:
                                     (default: 180; 0 disables low-speed detection)
   CODEX_TOOL_DOWNLOAD_MAX_TIME=N    Per-attempt large download max time (default: 0=no limit)
 
-GitHub API rate-limit fallback:
-  API requests normally honor the user's proxy environment/configuration. If GitHub
-  returns an API rate-limit 403, codex-tool prints a warning and retries that API
-  request once with proxies bypassed. Asset downloads continue to honor the normal
-  proxy configuration.
+GitHub API authentication / rate-limit fallback:
+  API requests use GITHUB_TOKEN when set, otherwise a token previously saved by
+  codex-tool. If an anonymous request is rate-limited, codex-tool first tries the
+  existing no-proxy fallback. If that cannot reach GitHub and the session is
+  interactive, it can guide you through creating a token, verify it through the
+  normal network path, and save it with mode 0600. Asset downloads continue to
+  honor the normal proxy configuration.
 USAGE
 }
 
@@ -166,8 +175,110 @@ is_rate_limit_response() {
   [[ "${msg,,}" == *"rate limit"* ]]
 }
 
+effective_github_token() {
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    printf '%s\n' "$GITHUB_TOKEN"
+    return 0
+  fi
+  if [[ -f "$GITHUB_TOKEN_FILE" ]]; then
+    local token=""
+    IFS= read -r token < "$GITHUB_TOKEN_FILE" || true
+    [[ -n "$token" ]] && printf '%s\n' "$token"
+  fi
+}
+
+github_token_source() {
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    printf 'environment GITHUB_TOKEN\n'
+  elif [[ -s "$GITHUB_TOKEN_FILE" ]]; then
+    printf 'saved token (%s)\n' "$GITHUB_TOKEN_FILE"
+  else
+    printf 'none\n'
+  fi
+}
+
+validate_github_token_text() {
+  local token="$1"
+  [[ -n "$token" ]] || return 1
+  [[ ! "$token" =~ [[:space:]] ]]
+}
+
+save_github_token() {
+  local token="$1" dir tmp
+  validate_github_token_text "$token" || die "refusing to save an empty token or token containing whitespace"
+  dir="$(dirname "$GITHUB_TOKEN_FILE")"
+  mkdir -p -- "$dir"
+  chmod 0700 -- "$dir" 2>/dev/null || true
+  tmp="$GITHUB_TOKEN_FILE.tmp.$"
+  ( umask 077; printf '%s\n' "$token" > "$tmp" )
+  chmod 0600 -- "$tmp"
+  mv -f -- "$tmp" "$GITHUB_TOKEN_FILE"
+  log "saved GitHub token to $GITHUB_TOKEN_FILE (mode 0600)"
+}
+
+print_github_token_help() {
+  cat >&2 <<EOF
+GitHub authentication can avoid the anonymous 60-requests/hour/IP API limit.
+
+Create a personal access token here:
+  $GITHUB_TOKEN_URL
+
+For this public openai/codex release lookup, codex-tool does not need repository
+write access. A classic PAT with no scopes is sufficient for public information.
+If you choose a fine-grained PAT, use the minimum access needed for public
+repository contents. Set an expiration appropriate for your environment.
+
+The token is used only for GitHub API authentication. Release asset downloads
+continue to use your normal network/proxy settings.
+EOF
+}
+
+write_curl_auth_config() {
+  local token="$1" dest="$2"
+  validate_github_token_text "$token" || return 1
+  ( umask 077; printf 'header = "Authorization: Bearer %s"\n' "$token" > "$dest" )
+}
+
+prompt_github_token_and_retry() {
+  local url="$1" output="$2" label="$3"
+  [[ -t 0 && -t 1 ]] || return 2
+
+  printf '\n' >&2
+  print_github_token_help
+  printf '\nPaste GitHub token (input hidden; empty input cancels): ' >&2
+  local token=""
+  IFS= read -r -s token
+  printf '\n' >&2
+  [[ -n "$token" ]] || { warn "GitHub token entry cancelled."; return 1; }
+  validate_github_token_text "$token" || { warn "token contains whitespace and was rejected."; return 1; }
+
+  local body="$WORK_DIR/api-token.$.json"
+  local headers="$WORK_DIR/api-token.$.headers"
+  local err="$WORK_DIR/api-token.$.stderr"
+  local result rc status msg
+  result="$(github_api_once "$url" "$body" "$headers" "$err" normal "$token")"
+  rc="$(sed -n '1p' <<<"$result")"
+  status="$(sed -n '2p' <<<"$result")"
+
+  if [[ "$rc" == "0" && "$status" =~ ^2[0-9][0-9]$ ]]; then
+    save_github_token "$token"
+    mv -f -- "$body" "$output"
+    warn "authenticated GitHub API request succeeded; the saved token will be used for future API requests."
+    return 0
+  fi
+
+  msg="$(github_error_message "$body")"
+  warn "the supplied GitHub token could not access $label (curl exit $rc, HTTP $status); it was not saved."
+  [[ -n "$msg" ]] && warn "GitHub: $msg"
+  if [[ -s "$err" ]]; then
+    warn "curl: $(tr '\n' ' ' < "$err" | sed 's/[[:space:]]\+/ /g' | cut -c1-500)"
+  fi
+  return 1
+}
+
 github_api_once() {
   local url="$1" body="$2" headers="$3" stderr_file="$4" mode="$5"
+  local token="${6:-}"
   local -a args=(
     --proto '=https'
     "${CURL_TLS_ARGS[@]}"
@@ -184,8 +295,14 @@ github_api_once() {
     -H 'X-GitHub-Api-Version: 2022-11-28'
     -H 'User-Agent: codex-tool'
   )
-  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
-    args+=( -H "Authorization: Bearer ${GITHUB_TOKEN}" )
+
+  if [[ -n "$token" ]]; then
+    local auth_config="$WORK_DIR/curl-auth.$$.cfg"
+    write_curl_auth_config "$token" "$auth_config" || {
+      printf '2\n000\n'
+      return 0
+    }
+    args+=( --config "$auth_config" )
   fi
   if [[ "$mode" == "direct" ]]; then
     # Explicitly override proxy env vars and any proxy configured by ~/.curlrc.
@@ -200,17 +317,20 @@ github_api_once() {
   printf '%s\n%s\n' "$rc" "${status:-000}"
 }
 
-# Fetch one GitHub REST API JSON document. Normal request uses the user's network
-# settings. Only an API rate-limit 403 triggers one explicit no-proxy retry.
+# Fetch one GitHub REST API JSON document. Normal requests use GITHUB_TOKEN when
+# provided, otherwise the token saved by codex-tool. Only an anonymous primary
+# rate-limit response triggers the no-proxy fallback and interactive token rescue.
 github_api_get() {
   local url="$1" output="$2" label="${3:-GitHub API request}"
   make_work_dir
   local normal_body="$WORK_DIR/api-normal.$$.json"
   local normal_headers="$WORK_DIR/api-normal.$$.headers"
   local normal_err="$WORK_DIR/api-normal.$$.stderr"
-  local result rc status msg remaining reset
+  local token token_source result rc status msg remaining reset
+  token="$(effective_github_token)"
+  token_source="$(github_token_source)"
 
-  result="$(github_api_once "$url" "$normal_body" "$normal_headers" "$normal_err" normal)"
+  result="$(github_api_once "$url" "$normal_body" "$normal_headers" "$normal_err" normal "$token")"
   rc="$(sed -n '1p' <<<"$result")"
   status="$(sed -n '2p' <<<"$result")"
 
@@ -230,12 +350,18 @@ github_api_get() {
       reset_text="$(date -d "@$reset" '+%Y-%m-%d %H:%M:%S %z' 2>/dev/null || true)"
       [[ -n "$reset_text" ]] && warn "rate-limit reset reported by GitHub: $reset_text"
     fi
+
+    if [[ -n "$token" ]]; then
+      warn "this request was already authenticated using $token_source; changing proxy paths will not restore that token's GitHub API quota."
+      return 1
+    fi
+
     warn "retrying this GitHub API request once with proxy use disabled; asset downloads will keep the normal proxy configuration."
 
     local direct_body="$WORK_DIR/api-direct.$$.json"
     local direct_headers="$WORK_DIR/api-direct.$$.headers"
     local direct_err="$WORK_DIR/api-direct.$$.stderr"
-    result="$(github_api_once "$url" "$direct_body" "$direct_headers" "$direct_err" direct)"
+    result="$(github_api_once "$url" "$direct_body" "$direct_headers" "$direct_err" direct "")"
     rc="$(sed -n '1p' <<<"$result")"
     status="$(sed -n '2p' <<<"$result")"
 
@@ -251,11 +377,21 @@ github_api_get() {
     if [[ -s "$direct_err" ]]; then
       warn "curl direct retry: $(tr '\n' ' ' < "$direct_err" | sed 's/[[:space:]]\+/ /g' | cut -c1-500)"
     fi
+
+    if prompt_github_token_and_retry "$url" "$output" "$label"; then
+      return 0
+    fi
+
+    if [[ ! -t 0 || ! -t 1 ]]; then
+      warn "interactive token setup is unavailable in this session."
+      print_github_token_help
+      warn "after creating a token, either export GITHUB_TOKEN or run 'codex-tool auth login' in an interactive shell."
+    fi
     return 1
   fi
 
   msg="$(github_error_message "$normal_body")"
-  warn "$label failed (curl exit $rc, HTTP $status)."
+  warn "$label failed (curl exit $rc, HTTP $status; auth source: $token_source)."
   [[ -n "$msg" ]] && warn "GitHub: $msg"
   if [[ -s "$normal_err" ]]; then
     warn "curl: $(tr '\n' ' ' < "$normal_err" | sed 's/[[:space:]]\+/ /g' | cut -c1-500)"
@@ -720,6 +856,55 @@ prune_all() {
   log "pruned all managed Codex versions and download cache; codex-tool and Codex user data were preserved"
 }
 
+auth_login() {
+  [[ -t 0 && -t 1 ]] || die "auth login requires an interactive terminal"
+  make_work_dir
+  local out="$WORK_DIR/auth-login.json"
+  print_github_token_help
+  printf '\nPaste GitHub token (input hidden): ' >&2
+  local token=""
+  IFS= read -r -s token
+  printf '\n' >&2
+  [[ -n "$token" ]] || die "empty token"
+  validate_github_token_text "$token" || die "token contains whitespace"
+
+  local body="$WORK_DIR/auth-login-body.json"
+  local headers="$WORK_DIR/auth-login.headers"
+  local err="$WORK_DIR/auth-login.stderr"
+  local result rc status msg
+  result="$(github_api_once "$API_BASE/releases/latest" "$body" "$headers" "$err" normal "$token")"
+  rc="$(sed -n '1p' <<<"$result")"
+  status="$(sed -n '2p' <<<"$result")"
+  if [[ "$rc" == "0" && "$status" =~ ^2[0-9][0-9]$ ]]; then
+    save_github_token "$token"
+    log "GitHub authentication verified against openai/codex release API"
+    return 0
+  fi
+  msg="$(github_error_message "$body")"
+  [[ -n "$msg" ]] && warn "GitHub: $msg"
+  [[ -s "$err" ]] && warn "curl: $(tr '\n' ' ' < "$err" | sed 's/[[:space:]]\+/ /g' | cut -c1-500)"
+  die "GitHub token verification failed (curl exit $rc, HTTP $status); token was not saved"
+}
+
+auth_status() {
+  printf 'GitHub auth source: %s' "$(github_token_source)"
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    printf ' (environment token takes precedence over saved token)\n'
+  else
+    printf '\n'
+  fi
+}
+
+auth_logout() {
+  if [[ -f "$GITHUB_TOKEN_FILE" || -L "$GITHUB_TOKEN_FILE" ]]; then
+    rm -f -- "$GITHUB_TOKEN_FILE"
+    log "removed saved GitHub token: $GITHUB_TOKEN_FILE"
+  else
+    log "no codex-tool saved GitHub token found"
+  fi
+  [[ -z "${GITHUB_TOKEN:-}" ]] || warn "GITHUB_TOKEN is still set in the current environment and will continue to take precedence."
+}
+
 main() {
   ensure_supported_platform
   need_cmd curl; need_cmd python3; need_cmd tar; need_cmd sha256sum; need_cmd find; need_cmd sort; need_cmd stat
@@ -761,6 +946,14 @@ main() {
       local yes=0 force=0; shift
       while (($#)); do case "$1" in --yes|-y) yes=1;; --force) force=1;; *) die "unknown prune option: $1";; esac; shift; done
       prune_all "$yes" "$force" ;;
+    auth)
+      [[ $# -eq 2 ]] || die "usage: codex-tool auth {login|status|logout}"
+      case "$2" in
+        login) auth_login ;;
+        status) auth_status ;;
+        logout) auth_logout ;;
+        *) die "usage: codex-tool auth {login|status|logout}" ;;
+      esac ;;
     version|--version|-V)
       printf 'codex-tool %s\n' "$TOOL_VERSION" ;;
     help|-h|--help)

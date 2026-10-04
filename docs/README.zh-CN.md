@@ -270,6 +270,8 @@ $XDG_RUNTIME_DIR/codex-tool
 
 1.9.0 进一步要求所有可能启动或连接长期 Codex daemon 的子进程在 exec 前显式关闭 codex-tool 的 manager-lock FD；codex-tool 自身退出时也显式 unlock/close。这样后台 app-server/updater 不会再继承并长期占用 codex-tool 的 `flock`。
 
+普通 `stop` 与官方 Codex lifecycle 保持一致：只停止 managed app-server，不主动结束独立 updater loop。只有旧版 updater 本身仍是 `manager.lock` 的真实持有者时，才会针对该已验证 PID 做定向终止；`prune` / `daemon repair` 才负责拆除完整 managed runtime。如果为了释放旧锁而在 mutation 开始前提前停止了 daemon，而后续下载/API/变更失败，codex-tool 会在退出阶段尽力恢复原先运行的 daemon。
+
 ## 文档
 
 - [完整使用手册](USAGE.md)

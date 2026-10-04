@@ -154,8 +154,8 @@ Anonymous GitHub REST API requests are rate-limited per source IP. This is often
 
 When an anonymous request is rate-limited, codex-tool:
 1. retries that API metadata request once without proxy use;
-2. if direct access fails and the shell is interactive, shows the GitHub token creation URL;
-3. accepts the token with hidden input, verifies it against the public `openai/codex` release API, and stores it at `~/.config/codex-tool/github-token` with mode `0600`.
+2. if direct access fails and the shell is interactive, shows a pre-filled GitHub fine-grained token creation URL;
+3. requests only read access to repository contents, accepts the token with hidden input, verifies it against the public `openai/codex` release API, and stores it at `~/.config/codex-tool/github-token` with mode `0600`.
 
 You can manage the saved token explicitly:
 

@@ -2354,7 +2354,7 @@ with open(sys.argv[2], encoding="utf-8") as f:
 parts=[]
 for name in sorted(set(expected) | set(actual)):
     if expected.get(name) != actual.get(name):
-        parts.append(f"{name}: cli={expected.get(name)!s.lower()} daemon={actual.get(name)!s.lower()}")
+        parts.append(f"{name}: cli={str(expected.get(name)).lower()} daemon={str(actual.get(name)).lower()}")
 print("; ".join(parts))
 PY
 )"

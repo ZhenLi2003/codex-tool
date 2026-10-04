@@ -56,10 +56,10 @@ The tool does not try to detect whether a proxy exists. It reacts only to a GitH
 If both the normal path and the direct retry fail, an interactive shell is offered an authenticated fallback. The token creation page is:
 
 ```text
-https://github.com/settings/tokens/new
+https://github.com/settings/personal-access-tokens/new
 ```
 
-For public `openai/codex` release metadata, codex-tool does not need repository write access. A classic personal access token with no scopes is sufficient for public information and gives authenticated API rate limits.
+For public `openai/codex` release metadata, codex-tool does not need repository write access. GitHub recommends fine-grained personal access tokens; the release endpoints need only `Contents: read`. The URL shown by codex-tool pre-fills that permission and a 90-day expiration.
 
 The token is entered with terminal echo disabled, verified before saving, then stored at:
 

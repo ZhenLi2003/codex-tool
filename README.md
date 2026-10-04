@@ -183,7 +183,7 @@ codex-tool clean --all
 
 Default `clean` deletes persisted threads whose current status is not active. Healthy background app-server/daemon processes stay running.
 
-`clean --all` additionally requests `turn/interrupt` for active threads, waits for them to leave the active state, then deletes their persisted thread records through `thread/delete`.
+`clean --all` additionally requests `turn/interrupt` for active threads, waits for them to leave the active state, then deletes their persisted thread records through `thread/delete`. If live/internal state still blocks complete deletion and the server is a managed daemon, codex-tool temporarily stops that daemon, retries the remaining cleanup through an isolated stdio app-server, and restores the daemon afterward.
 
 No clean mode directly removes `sessions/`, `archived_sessions/`, `thread_history_*.sqlite`, `state_*.sqlite`, or Codex lock files.
 

@@ -53,7 +53,7 @@ cleanup() {
     IFS= read -r holder < "$MANAGER_PID_FILE" || true
     [[ "$holder" != "$$" ]] || rm -f -- "$MANAGER_PID_FILE"
   fi
-  if [[ -e "/proc/$/fd/9" ]]; then
+  if [[ -e "/proc/$$/fd/9" ]]; then
     flock -u 9 2>/dev/null || true
     exec 9>&-
   fi

@@ -11,9 +11,9 @@
 - **安装简单**：项目核心只有 `install.sh` 和 `codex-tool` 两个脚本。
 - **支持多版本切换**：可同时保留多个 Codex 版本，并快速切换当前版本。
 - **安装完整运行时**：使用完整 Codex package，包括 `codex-code-mode-host` 等现代组件。
-- **感知后台 daemon 生命周期**：版本激活时安全停止/恢复 managed app-server，`clean` 不再删除 daemon 状态或 package。
+- **适配新版 app-server/daemon 生命周期**：版本激活与 managed daemon 协调；会话清理由 Codex 官方 app-server API 完成，不再直接删除 `CODEX_HOME` 内部状态。
 - **只读命令不再被全局锁阻塞**：`version`、`help`、`list`、`auth status`、`daemon status` 不获取独占 manager lock。
-- **保留用户数据**：`~/.codex` 中的配置、认证、daemon package 以及未来未知状态默认保留。
+- **明确数据所有权**：codex-tool 直接管理自己的 CLI 版本；持久化 thread 则交给 Codex 官方 app-server RPC 管理。
 - **适合不稳定网络**：大文件支持断点续传、自动重试和 SHA-256 校验。
 - **自动处理 GitHub API 限流场景**：如果共享代理出口耗尽匿名 API 配额，工具会先尝试直连；若直连不可用，则在交互终端中引导创建 GitHub access token，隐藏输入并验证后，以 `0600` 权限保存，后续 API 请求自动复用。
 
@@ -94,9 +94,12 @@ codex-tool update                 安装并激活最新稳定版本
 codex-tool list                   查看当前版本和本地已安装版本
 codex-tool switch X.Y.Z           切换到已安装版本
 codex-tool delete X.Y.Z           删除非当前版本
-codex-tool clean [--yes]          仅清理已知历史/日志数据；保留配置、认证、daemon 状态/package
-codex-tool prune [--yes] [--force]
-                                  按需停止 managed daemon，再删除 codex-tool 管理的版本、缓存和 codex 链接
+codex-tool clean [--all] [--dry-run] [--yes]
+                                  通过 Codex app-server 清理持久化会话；默认只删除
+                                  非活跃 thread，--all 会中断并删除后台 thread
+codex-tool prune [--dry-run] [--yes] [--force]
+                                  删除 loaded/background thread、停止 daemon，并清理
+                                  Codex 程序/runtime；保留非活跃历史和用户配置/认证
 codex-tool version                查看 codex-tool 版本
 codex-tool daemon status          查看 app-server daemon 状态
 codex-tool daemon repair [--yes]  修复 stale managed daemon 运行时状态
@@ -166,23 +169,55 @@ Codex 用户配置和运行数据仍保存在：
 
 ## Daemon-aware 生命周期
 
-新版 Codex 会在 `CODEX_HOME` 下维护 managed app-server daemon。codex-tool 1.7.0 将其作为独立生命周期组件处理：
+新版 Codex 已经是由长期运行的 app-server、持久化 thread store、SQLite state、writer lock 和 managed daemon package 共同组成的本地运行时。codex-tool 1.8.0 不再把 `CODEX_HOME` 当作可以直接清理的缓存目录。
 
-- `install` / `update` / `switch` 在下载和校验完成后，只有进入真正的版本激活事务时才停止健康的 managed daemon，并在切换后恢复。
-- 如果 daemon 恢复失败，新 CLI 仍保持激活，旧版本不会被自动清理，便于后续恢复。
-- `prune` 会停止 managed daemon 并故意保持 stopped，但不会删除 `CODEX_HOME/packages/app-server-daemon`、daemon 设置或用户数据。
-- `clean` 改为删除 allowlist，只清理 `sessions/`、`archived_sessions/`、`history.jsonl`、`log/`。
-- `clean` 不再“删除整个 `CODEX_HOME` 后恢复两个文件”，因此 `config.toml`、`auth.json`、daemon 状态、packages 以及未来未知目录都会保留。
-- 如果某个受管理版本仍被前台 Codex 进程引用，`delete`、自动历史清理、同版本替换及 `prune` 都不会删除它。
+对于 `install` / `update` / `switch`，下载、SHA 校验和 package validation 阶段不会打断现有 daemon；真正激活版本时才停止健康的 managed daemon，并在切换后恢复。
 
-诊断与修复：
+会话管理改为调用 Codex 官方 app-server JSON-RPC：
+
+```text
+thread/list
+thread/read
+thread/loaded/list
+thread/turns/list
+turn/interrupt
+thread/delete
+```
+
+### clean
+
+```bash
+codex-tool clean --dry-run
+codex-tool clean
+codex-tool clean --all
+```
+
+默认 `clean` 删除当前状态不是 active 的持久化 thread，健康的后台 app-server/daemon 保持运行。
+
+`clean --all` 会额外对 active thread 请求 `turn/interrupt`，等待其退出 active 状态，然后通过 `thread/delete` 删除持久化记录。
+
+任何 clean 模式都不会直接删除 `sessions/`、`archived_sessions/`、`thread_history_*.sqlite`、`state_*.sqlite` 或 Codex 锁文件。
+
+### prune
+
+`prune` 定位为“程序与后台 runtime 清理”：
+
+1. 通过 app-server 枚举 loaded/background thread；
+2. 对 active turn 请求 interrupt；
+3. 停止 managed daemon；
+4. 使用临时 stdio app-server 删除此前 loaded/background thread 的持久化记录；
+5. 删除 codex-tool 管理的版本/current/download cache、`codex` 链接、managed daemon/standalone package，以及 daemon runtime state。
+
+默认保留已经结束的非活跃会话历史，以及用户配置、认证、skills、rules 等用户状态。
+
+如果仍有前台 Codex 进程正在使用受管理 executable，prune 会 fail closed，不会从运行进程下方删除程序文件。
+
+诊断和 stale-state 修复仍使用：
 
 ```bash
 codex-tool daemon status
 codex-tool daemon repair
 ```
-
-当 daemon 状态为 stale/unknown，或者发现 unmanaged app-server 时，普通变更命令会 fail closed；只有显式的 `daemon repair` 才进入 stale managed daemon 的恢复流程。
 
 ## GitHub API 认证与限流恢复
 
@@ -230,6 +265,8 @@ $XDG_RUNTIME_DIR/codex-tool
 ```
 
 锁目录必须属于当前用户，并强制为 `0700`。锁等待由 `CODEX_TOOL_LOCK_TIMEOUT` 控制，默认 10 秒；超时后会明确报错，并在可用时显示持锁 PID/命令，不再无限卡住。
+
+1.8.0 进一步要求所有可能启动或连接长期 Codex daemon 的子进程在 exec 前显式关闭 codex-tool 的 manager-lock FD；codex-tool 自身退出时也显式 unlock/close。这样后台 app-server/updater 不会再继承并长期占用 codex-tool 的 `flock`。
 
 ## 文档
 

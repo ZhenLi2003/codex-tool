@@ -2,6 +2,26 @@
 
 This file summarizes the major iterations of `codex-tool`.
 
+## 1.9.0
+
+- Added top-level `codex-tool stop` and `codex-tool daemon stop` to stop the managed Codex app-server through the official daemon lifecycle.
+- `stop` intentionally bypasses the codex-tool manager lock so it can recover from locks inherited by old daemon processes; it refuses to interfere with a genuine in-flight codex-tool mutation.
+- Centralized app-server shutdown in one stop primitive used by version activation, clean, prune, stale-state recovery, and explicit stop.
+- Mutation lock acquisition now detects when the lock holder is a verified managed Codex daemon from an older release, snapshots active/loaded thread IDs, automatically stops the daemon, waits for lock release, and proceeds.
+- Default `clean` now snapshots active threads, stops app-server, deletes only sessions that were inactive before the stop, then restores the daemon when it was previously running.
+- `clean --all` stops app-server and deletes all persisted threads.
+- `prune` uses a single stop boundary and uses the pre-stop loaded-thread snapshot when legacy-lock recovery already stopped the daemon.
+- `clean --dry-run` and `prune --dry-run` no longer acquire the manager mutation lock or stop app-server.
+- Installer migration logic automatically detects and releases manager locks inherited by old managed daemons before overwriting codex-tool.
+- Fixed installer Bash variable expansion introduced while adding legacy-lock recovery.
+- Retained FD 9 isolation for every Codex daemon/session-management child process.
+
+## 1.8.1
+
+- Added installer-side detection of manager locks inherited by older managed Codex daemons.
+- Installer attempts official daemon stop first and falls back only to verified managed daemon holders.
+- Stale manager PID metadata and the retired 1.7.0 `TOOL_HOME/.lock` file are cleaned only after the corresponding flock is confirmed free.
+
 ## 1.8.0
 
 - Redefined `clean` as Codex session/thread cleanup and `prune` as Codex program/runtime cleanup.

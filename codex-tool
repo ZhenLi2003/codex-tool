@@ -2477,12 +2477,44 @@ finally:
 PY
 }
 
+daemon_terminate_app_server_processes() {
+  local pids pid deadline remaining
+  pids="$(daemon_app_server_pids)"
+  [[ -n "$pids" ]] || return 0
+
+  warn "terminating stale managed Codex app-server process(es): $(tr '\n' ' ' <<<"$pids" | sed 's/[[:space:]]\+/ /g')"
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    kill -TERM "$pid" 2>/dev/null || true
+  done <<<"$pids"
+
+  deadline=$((SECONDS + 5))
+  while (( SECONDS < deadline )); do
+    remaining="$(daemon_app_server_pids)"
+    [[ -z "$remaining" ]] && return 0
+    sleep 1
+  done
+
+  remaining="$(daemon_app_server_pids)"
+  if [[ -n "$remaining" ]]; then
+    warn "forcing termination of stale managed Codex app-server process(es): $(tr '\n' ' ' <<<"$remaining" | sed 's/[[:space:]]\+/ /g')"
+    while IFS= read -r pid; do
+      [[ -n "$pid" ]] || continue
+      kill -KILL "$pid" 2>/dev/null || true
+    done <<<"$remaining"
+    sleep 1
+  fi
+
+  remaining="$(daemon_app_server_pids)"
+  [[ -z "$remaining" ]] || { warn "managed app-server processes are still running: $remaining"; return 1; }
+}
+
 daemon_terminate_managed_processes() {
   local pids pid deadline remaining
   pids="$(daemon_managed_pids)"
   [[ -n "$pids" ]] || return 0
 
-  warn "terminating stale managed Codex app-server process(es): $(tr '\n' ' ' <<<"$pids" | sed 's/[[:space:]]\+/ /g')"
+  warn "terminating managed Codex runtime process(es): $(tr '\n' ' ' <<<"$pids" | sed 's/[[:space:]]\+/ /g')"
   while IFS= read -r pid; do
     [[ -n "$pid" ]] || continue
     kill -TERM "$pid" 2>/dev/null || true
@@ -2497,7 +2529,7 @@ daemon_terminate_managed_processes() {
 
   remaining="$(daemon_managed_pids)"
   if [[ -n "$remaining" ]]; then
-    warn "forcing termination of stale managed Codex app-server process(es): $(tr '\n' ' ' <<<"$remaining" | sed 's/[[:space:]]\+/ /g')"
+    warn "forcing termination of managed Codex runtime process(es): $(tr '\n' ' ' <<<"$remaining" | sed 's/[[:space:]]\+/ /g')"
     while IFS= read -r pid; do
       [[ -n "$pid" ]] || continue
       kill -KILL "$pid" 2>/dev/null || true
@@ -2506,10 +2538,10 @@ daemon_terminate_managed_processes() {
   fi
 
   remaining="$(daemon_managed_pids)"
-  [[ -z "$remaining" ]] || { warn "managed app-server processes are still running: $remaining"; return 1; }
+  [[ -z "$remaining" ]] || { warn "managed Codex runtime processes are still running: $remaining"; return 1; }
 }
 
-daemon_cleanup_transient_state() {
+daemon_cleanup_app_server_state() {
   local state="$CODEX_DATA_DIR/app-server-daemon"
   local control="$CODEX_DATA_DIR/app-server-control"
   local advertised="$control/app-server-control.sock"
@@ -2541,13 +2573,16 @@ daemon_cleanup_transient_state() {
     rm -f -- "$advertised"
   fi
   rm -f -- "$control/app-server-startup.lock"
+  rm -f -- "$state/app-server.pid" "$state/daemon.pid"
 
-  local name
-  for name in app-server.pid app-server-updater.pid daemon.pid daemon-updater.pid; do
-    rm -f -- "$state/$name"
-  done
+  # Preserve updater pid records, settings, logs, recovery metadata, and packages.
+  return 0
+}
 
-  # Preserve settings.json, logs, loaded-threads.json and managed packages.
+daemon_cleanup_transient_state() {
+  local state="$CODEX_DATA_DIR/app-server-daemon"
+  daemon_cleanup_app_server_state || return 1
+  rm -f -- "$state/app-server-updater.pid" "$state/daemon-updater.pid"
   return 0
 }
 

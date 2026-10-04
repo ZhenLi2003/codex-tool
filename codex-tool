@@ -765,12 +765,24 @@ except Exception:
 PY
 }
 
-daemon_pid_records_present() {
+daemon_app_server_pid_records_present() {
   local state="$CODEX_DATA_DIR/app-server-daemon" name
-  for name in app-server.pid app-server-updater.pid daemon.pid daemon-updater.pid; do
+  for name in app-server.pid daemon.pid; do
     [[ -e "$state/$name" || -L "$state/$name" ]] && return 0
   done
   return 1
+}
+
+daemon_updater_pid_records_present() {
+  local state="$CODEX_DATA_DIR/app-server-daemon" name
+  for name in app-server-updater.pid daemon-updater.pid; do
+    [[ -e "$state/$name" || -L "$state/$name" ]] && return 0
+  done
+  return 1
+}
+
+daemon_pid_records_present() {
+  daemon_app_server_pid_records_present || daemon_updater_pid_records_present
 }
 
 daemon_managed_pids() {
@@ -795,8 +807,31 @@ daemon_managed_pids() {
   done
 }
 
+daemon_updater_pids() {
+  local pid cmd
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    cmd="$(process_cmdline "$pid")"
+    [[ "$cmd" == *"pid-update-loop"* ]] && printf '%s\n' "$pid"
+  done < <(daemon_managed_pids)
+}
+
+daemon_app_server_pids() {
+  local pid cmd
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    cmd="$(process_cmdline "$pid")"
+    [[ "$cmd" == *"pid-update-loop"* ]] && continue
+    printf '%s\n' "$pid"
+  done < <(daemon_managed_pids)
+}
+
 daemon_has_processes() {
   [[ -n "$(daemon_managed_pids | head -n1)" ]]
+}
+
+daemon_has_app_server_processes() {
+  [[ -n "$(daemon_app_server_pids | head -n1)" ]]
 }
 
 daemon_snapshot() {
@@ -811,7 +846,10 @@ daemon_snapshot() {
   local binary
   binary="$(daemon_find_control_binary 2>/dev/null || true)"
   if [[ -z "$binary" ]]; then
-    if daemon_has_processes || daemon_pid_records_present || [[ -e "$CODEX_DATA_DIR/app-server-control" ]]; then
+    if daemon_has_app_server_processes || daemon_app_server_pid_records_present || \
+       [[ -e "$CODEX_DATA_DIR/app-server-control/app-server-control.sock" || -L "$CODEX_DATA_DIR/app-server-control/app-server-control.sock" ]]; then
+      DAEMON_STATE="unknown"
+    elif daemon_has_processes || daemon_updater_pid_records_present; then
       DAEMON_STATE="unknown"
     fi
     return 0
@@ -851,12 +889,15 @@ daemon_snapshot() {
     return 0
   fi
 
-  if daemon_has_processes || daemon_pid_records_present || \
+  if daemon_has_app_server_processes || daemon_app_server_pid_records_present || \
      [[ -e "$CODEX_DATA_DIR/app-server-control/app-server-control.sock" || -L "$CODEX_DATA_DIR/app-server-control/app-server-control.sock" ]]; then
     DAEMON_STATE="stale"
     DAEMON_WAS_RUNNING=1
   else
-    DAEMON_STATE="unknown"
+    # Official daemon stop leaves the optional updater loop alive. If there is
+    # no app-server process, pid record, or control socket, treat this as a
+    # normal stopped app-server rather than a stale daemon.
+    DAEMON_STATE="stopped"
   fi
 }
 

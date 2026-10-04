@@ -252,6 +252,46 @@ wait_manager_lock_free() {
   return 1
 }
 
+terminate_managed_lock_holders() {
+  local lock_file="$1" pids pid remaining
+
+  pids="$(manager_lock_holder_pids "$lock_file" | sort -u)"
+  [[ -n "$pids" ]] || return 1
+
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    is_codex_tool_manager_pid "$pid" && return 1
+    if ! is_managed_daemon_pid "$pid"; then
+      warn "refusing to terminate unknown manager-lock holder PID $pid: $(process_cmdline "$pid")"
+      return 1
+    fi
+  done <<<"$pids"
+
+  warn "terminating verified legacy Codex process(es) still holding manager.lock: $(tr '\n' ' ' <<<"$pids" | sed 's/[[:space:]]\+/ /g')"
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    kill -TERM "$pid" 2>/dev/null || true
+  done <<<"$pids"
+
+  wait_manager_lock_free "$lock_file" 5 && return 0
+
+  remaining="$(manager_lock_holder_pids "$lock_file" | sort -u)"
+  [[ -n "$remaining" ]] || return 1
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    is_codex_tool_manager_pid "$pid" && return 1
+    is_managed_daemon_pid "$pid" || return 1
+  done <<<"$remaining"
+
+  warn "legacy Codex lock holder(s) did not exit after TERM; forcing: $(tr '\n' ' ' <<<"$remaining" | sed 's/[[:space:]]\+/ /g')"
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    kill -KILL "$pid" 2>/dev/null || true
+  done <<<"$remaining"
+
+  wait_manager_lock_free "$lock_file" 5
+}
+
 capture_threads_before_prelock_stop() {
   make_work_dir
 
@@ -302,8 +342,11 @@ recover_daemon_inherited_manager_lock() {
   fi
 
   if ! wait_manager_lock_free "$lock_file" 10; then
-    warn "managed daemon stopped, but the legacy manager lock is still held"
-    return 1
+    warn "app-server stopped but manager.lock is still held; checking for a legacy updater lock holder"
+    if ! terminate_managed_lock_holders "$lock_file"; then
+      warn "unable to release legacy manager.lock safely"
+      return 1
+    fi
   fi
 
   rm -f -- "$(dirname "$lock_file")/manager.pid"

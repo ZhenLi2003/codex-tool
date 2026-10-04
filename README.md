@@ -92,7 +92,7 @@ codex-tool clean [--all] [--dry-run] [--yes]
                                   Delete persisted sessions through the Codex app-server.
                                   Default: inactive threads only; --all also interrupts
                                   and deletes active/background threads.
-codex-tool prune [--dry-run] [--yes] [--force]
+codex-tool prune [--dry-run] [--purge-history] [--yes] [--force]
                                   Delete loaded/background threads, stop the daemon,
                                   and remove Codex program/runtime assets while
                                   preserving inactive saved history and user config/auth
@@ -160,7 +160,7 @@ Updating the manager or switching Codex versions does not clear that directory.
 
 ## Daemon-aware lifecycle
 
-Modern Codex uses a long-lived app-server, persisted thread storage, SQLite-backed state, writer locks, and managed daemon packages. codex-tool 1.9.0 no longer treats `CODEX_HOME` as a cache directory.
+Modern Codex uses a long-lived app-server, persisted thread storage, SQLite-backed state, writer locks, and managed daemon packages. codex-tool 1.9.1 treats `CODEX_HOME` as Codex-owned state rather than a disposable cache.
 
 For `install`, `update`, and `switch`, codex-tool keeps the existing daemon running during download and package verification, then automatically stops the managed app-server before version activation and restores it afterward when it was previously running. The same stop primitive is shared by clean/prune and stale-lock recovery.
 
@@ -203,12 +203,16 @@ It preserves inactive saved thread history and user-owned configuration/authenti
 
 Foreground Codex processes using managed binaries cause prune to fail closed rather than deleting executables beneath a running process.
 
-Diagnostics and stale-state recovery remain available:
+Diagnostics and recovery are protocol-aware in 1.9.1:
 
 ```bash
 codex-tool daemon status
 codex-tool daemon repair
 ```
+
+A daemon is no longer considered healthy merely because its PID, socket, and `daemon version` probe are alive. When the managed app-server is running, `daemon status` also calls `experimentalFeature/list` and compares the shared-service feature settings with a temporary stdio app-server started from the active CLI. It checks `api_key_model_discovery`, `code_mode_host`, `auth_elicitation`, and `mcp_oauth_refresh_coordination`.
+
+If the shared daemon RPC is broken or these launch-time feature settings are incompatible, `daemon repair` first establishes a fresh stop/start boundary. A fresh official `daemon start` clears stale launch feature overrides. If compatibility is still broken, repair performs a second-stage package repair with `codex app-server daemon update --from-cli --yes`, then starts the daemon and verifies the protocol again.
 
 ## GitHub API authentication
 

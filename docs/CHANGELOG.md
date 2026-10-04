@@ -2,6 +2,19 @@
 
 This file summarizes the major iterations of `codex-tool`.
 
+## 1.9.1
+
+- Fixed a false-healthy daemon state where `daemon version`, PID, and socket probes succeeded but normal Codex failed during shared-background-server compatibility negotiation with `Experimental feature request failed`.
+- Added a deep daemon compatibility probe using the official `experimentalFeature/list` RPC.
+- The probe compares the managed daemon against a temporary stdio app-server from the active CLI for `api_key_model_discovery`, `code_mode_host`, `auth_elicitation`, and `mcp_oauth_refresh_coordination`.
+- `daemon status` now reports protocol compatibility separately from lifecycle state and returns failure for a genuinely broken/mismatched running daemon.
+- `daemon repair` now repairs running-but-incompatible daemons instead of returning “healthy” solely from the lifecycle probe.
+- Repair first uses a fresh stop/start boundary to clear stale launch-time feature overrides, then rechecks compatibility.
+- If fresh restart is insufficient, repair falls back to `codex app-server daemon update --from-cli --yes` to realign the managed daemon package with the active complete CLI package, then starts and verifies it again.
+- Version activation/restoration now performs the same compatibility check after restarting a previously running daemon and reports failure rather than silently leaving an unusable shared server.
+- Preserved backwards compatibility: if the active CLI itself cannot provide the feature-list probe, codex-tool reports compatibility as unavailable instead of falsely classifying the daemon as broken.
+- Fixed daemon repair after legacy manager-lock recovery so a daemon stopped early to release an inherited lock is still restarted and compatibility-checked.
+
 ## 1.9.0
 
 - Added top-level `codex-tool stop` and `codex-tool daemon stop` to stop the managed Codex app-server through the official daemon lifecycle.

@@ -87,6 +87,7 @@ codex-tool update                 Install/activate the latest stable version
 codex-tool list                   Show current and locally installed versions
 codex-tool switch X.Y.Z           Switch to an installed version
 codex-tool delete X.Y.Z           Delete an installed non-current version
+codex-tool stop                   Stop the managed Codex app-server daemon
 codex-tool clean [--all] [--dry-run] [--yes]
                                   Delete persisted sessions through the Codex app-server.
                                   Default: inactive threads only; --all also interrupts
@@ -97,6 +98,7 @@ codex-tool prune [--dry-run] [--yes] [--force]
                                   preserving inactive saved history and user config/auth
 codex-tool version                Show codex-tool version
 codex-tool daemon status          Inspect app-server daemon state
+codex-tool daemon stop            Alias of codex-tool stop
 codex-tool daemon repair [--yes]  Repair stale managed daemon runtime state
 codex-tool auth login             Save and verify a GitHub access token
 codex-tool auth status            Show the active GitHub auth source
@@ -158,9 +160,9 @@ Updating the manager or switching Codex versions does not clear that directory.
 
 ## Daemon-aware lifecycle
 
-Modern Codex uses a long-lived app-server, persisted thread storage, SQLite-backed state, writer locks, and managed daemon packages. codex-tool 1.8.0 no longer treats `CODEX_HOME` as a cache directory.
+Modern Codex uses a long-lived app-server, persisted thread storage, SQLite-backed state, writer locks, and managed daemon packages. codex-tool 1.9.0 no longer treats `CODEX_HOME` as a cache directory.
 
-For `install`, `update`, and `switch`, codex-tool keeps the existing daemon running during download and package verification, then stops/restores a healthy managed daemon only around version activation.
+For `install`, `update`, and `switch`, codex-tool keeps the existing daemon running during download and package verification, then automatically stops the managed app-server before version activation and restores it afterward when it was previously running. The same stop primitive is shared by clean/prune and stale-lock recovery.
 
 For session cleanup, codex-tool uses the official app-server JSON-RPC methods rather than deleting rollout files or SQLite databases directly:
 
@@ -181,9 +183,9 @@ codex-tool clean
 codex-tool clean --all
 ```
 
-Default `clean` deletes persisted threads whose current status is not active. Healthy background app-server/daemon processes stay running.
+Default `clean` first snapshots which persisted threads are active, then automatically stops the managed app-server, deletes only threads that were already inactive before the stop, and restores the daemon when it was previously running. This prevents the stop boundary from reclassifying active threads as deletable.
 
-`clean --all` additionally requests `turn/interrupt` for active threads, waits for them to leave the active state, then deletes their persisted thread records through `thread/delete`. If live/internal state still blocks complete deletion and the server is a managed daemon, codex-tool temporarily stops that daemon, retries the remaining cleanup through an isolated stdio app-server, and restores the daemon afterward.
+`clean --all` uses the same stop boundary but deletes all persisted threads, including those that were active/background before the stop.
 
 No clean mode directly removes `sessions/`, `archived_sessions/`, `thread_history_*.sqlite`, `state_*.sqlite`, or Codex lock files.
 
@@ -243,7 +245,7 @@ Mutation commands use a host-local runtime lock under `$XDG_RUNTIME_DIR/codex-to
 
 Lock acquisition is bounded by `CODEX_TOOL_LOCK_TIMEOUT` (default: 10 seconds). If another mutation still holds the lock, codex-tool reports the holder PID/command when available instead of waiting indefinitely.
 
-In 1.8.0, every Codex subprocess that can start or communicate with a long-lived daemon explicitly closes the manager-lock file descriptor before exec. The codex-tool parent also explicitly unlocks/closes it on exit. This prevents app-server or updater descendants from accidentally keeping the codex-tool `flock` alive after the manager exits.
+In 1.9.0, every Codex subprocess that can start or communicate with a long-lived daemon explicitly closes the manager-lock file descriptor before exec. The codex-tool parent also explicitly unlocks/closes it on exit. `codex-tool stop` intentionally bypasses the manager lock so it can release a lock inherited by an old daemon, while refusing to stop app-server if the same lock is held by a real in-flight codex-tool mutation. Mutation commands also detect this legacy condition before locking, stop the managed daemon automatically, and then acquire the lock normally.
 
 ## Documentation
 
@@ -255,3 +257,16 @@ In 1.8.0, every Codex subprocess that can start or communicate with a long-lived
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+
+### Explicit app-server stop
+
+```bash
+codex-tool stop
+# equivalent alias:
+codex-tool daemon stop
+```
+
+This invokes the official managed daemon stop lifecycle first and falls back only to verified managed Codex processes when daemon state is stale. It does not kill unmanaged app-server processes.
+
+The command does not acquire the codex-tool manager lock before stopping app-server. This is deliberate: it remains usable when an older daemon has inherited and is still holding that lock. If a real codex-tool mutation owns the lock, `stop` refuses to interfere.

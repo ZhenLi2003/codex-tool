@@ -2177,30 +2177,33 @@ main() {
       ;;
     clean)
       init_manager_mutation
-      local yes=0
+      local yes=0 all_threads=0 dry_run=0
       shift
       while (($#)); do
         case "$1" in
           --yes|-y) yes=1 ;;
+          --all) all_threads=1 ;;
+          --dry-run) dry_run=1 ;;
           *) die "unknown clean option: $1" ;;
         esac
         shift
       done
-      clean_data "$yes"
+      clean_data "$yes" "$all_threads" "$dry_run"
       ;;
     prune)
       init_manager_mutation
-      local yes=0 force=0
+      local yes=0 force=0 dry_run=0
       shift
       while (($#)); do
         case "$1" in
           --yes|-y) yes=1 ;;
           --force) force=1 ;;
+          --dry-run) dry_run=1 ;;
           *) die "unknown prune option: $1" ;;
         esac
         shift
       done
-      prune_all "$yes" "$force"
+      prune_all "$yes" "$force" "$dry_run"
       ;;
     daemon)
       [[ $# -ge 2 ]] || die "usage: codex-tool daemon {status|repair [--yes]}"

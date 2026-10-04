@@ -91,7 +91,7 @@ pid_exe() {
 is_codex_tool_holder() {
   local pid="$1" cmd
   cmd="$(pid_cmdline "$pid")"
-  [[ "$cmd" == *"codex-tool"* ]]
+  [[ "$cmd" =~ (^|[[:space:]])([^[:space:]]*/)?codex-tool([[:space:]]|$) ]]
 }
 
 is_managed_daemon_holder() {

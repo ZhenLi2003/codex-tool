@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 022
 
-TOOL_VERSION="1.7.0"
+TOOL_VERSION="1.7.1"
 TOOL_HOME="${CODEX_TOOL_HOME:-$HOME/scripts/codex-tool}"
 VERSIONS_DIR="$TOOL_HOME/versions"
 DOWNLOADS_DIR="$TOOL_HOME/downloads"
@@ -23,6 +23,7 @@ DOWNLOAD_RETRIES="${CODEX_TOOL_DOWNLOAD_RETRIES:-8}"
 DOWNLOAD_RETRY_DELAY="${CODEX_TOOL_DOWNLOAD_RETRY_DELAY:-5}"
 DOWNLOAD_STALL_TIME="${CODEX_TOOL_DOWNLOAD_STALL_TIME:-180}"
 DOWNLOAD_MAX_TIME="${CODEX_TOOL_DOWNLOAD_MAX_TIME:-0}"
+LOCK_TIMEOUT="${CODEX_TOOL_LOCK_TIMEOUT:-10}"
 CONFIG_DIR="${CODEX_TOOL_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/codex-tool}"
 GITHUB_TOKEN_FILE="${CODEX_TOOL_GITHUB_TOKEN_FILE:-$CONFIG_DIR/github-token}"
 GITHUB_TOKEN_URL="https://github.com/settings/personal-access-tokens/new?name=codex-tool&description=GitHub+API+access+for+codex-tool&expires_in=90&contents=read"
@@ -36,6 +37,8 @@ DAEMON_BACKEND=""
 DAEMON_WAS_RUNNING=0
 DAEMON_LAST_JSON=""
 DAEMON_LAST_ERR=""
+MANAGER_LOCK_DIR=""
+MANAGER_PID_FILE=""
 
 log()  { printf '==> %s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
@@ -44,6 +47,11 @@ die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 cleanup() {
   if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then
     rm -rf -- "$WORK_DIR"
+  fi
+  if [[ -n "$MANAGER_PID_FILE" && -f "$MANAGER_PID_FILE" ]]; then
+    local holder=""
+    IFS= read -r holder < "$MANAGER_PID_FILE" || true
+    [[ "$holder" != "$" ]] || rm -f -- "$MANAGER_PID_FILE"
   fi
 }
 trap cleanup EXIT
@@ -84,6 +92,7 @@ Environment:
   CODEX_TOOL_DOWNLOAD_STALL_TIME=N  Abort/resume if transfer stays below 1 B/s for N sec
                                     (default: 180; 0 disables low-speed detection)
   CODEX_TOOL_DOWNLOAD_MAX_TIME=N    Per-attempt large download max time (default: 0=no limit)
+  CODEX_TOOL_LOCK_TIMEOUT=N          Manager lock wait in seconds (default: 10)
 
 GitHub API authentication / rate-limit fallback:
   API requests use GITHUB_TOKEN when set, otherwise a token previously saved by
@@ -133,8 +142,55 @@ ensure_layout() { mkdir -p -- "$TOOL_HOME" "$VERSIONS_DIR" "$DOWNLOADS_DIR" "$LO
 
 lock_manager() {
   need_cmd flock
-  exec 9>"$TOOL_HOME/.lock"
-  flock -x 9
+  need_cmd stat
+  validate_uint CODEX_TOOL_LOCK_TIMEOUT "$LOCK_TIMEOUT"
+
+  local lock_root=""
+  if [[ -n "${XDG_RUNTIME_DIR:-}" && -d "$XDG_RUNTIME_DIR" && ! -L "$XDG_RUNTIME_DIR" ]]; then
+    local runtime_owner
+    runtime_owner="$(stat -c '%u' "$XDG_RUNTIME_DIR" 2>/dev/null || true)"
+    if [[ "$runtime_owner" == "$UID" ]]; then
+      lock_root="$XDG_RUNTIME_DIR/codex-tool"
+    fi
+  fi
+  [[ -n "$lock_root" ]] || lock_root="/tmp/codex-tool-$UID"
+
+  if [[ -e "$lock_root" || -L "$lock_root" ]]; then
+    [[ -d "$lock_root" && ! -L "$lock_root" ]] \
+      || die "manager lock path is not a normal directory: $lock_root"
+  else
+    ( umask 077; mkdir -- "$lock_root" ) \
+      || die "unable to create manager lock directory: $lock_root"
+  fi
+
+  local owner mode
+  owner="$(stat -c '%u' "$lock_root" 2>/dev/null || true)"
+  [[ "$owner" == "$UID" ]] \
+    || die "manager lock directory is not owned by the current user: $lock_root"
+  chmod 0700 -- "$lock_root" \
+    || die "unable to secure manager lock directory: $lock_root"
+  mode="$(stat -c '%a' "$lock_root" 2>/dev/null || true)"
+  [[ "$mode" == "700" ]] \
+    || die "manager lock directory must have mode 0700: $lock_root (mode=$mode)"
+
+  MANAGER_LOCK_DIR="$lock_root"
+  MANAGER_PID_FILE="$lock_root/manager.pid"
+  exec 9>"$lock_root/manager.lock"
+
+  if ! flock -w "$LOCK_TIMEOUT" -x 9; then
+    local holder=""
+    if [[ -f "$MANAGER_PID_FILE" ]]; then
+      IFS= read -r holder < "$MANAGER_PID_FILE" || true
+    fi
+    if [[ "$holder" =~ ^[0-9]+$ && -r "/proc/$holder/cmdline" ]]; then
+      local holder_cmd
+      holder_cmd="$(tr '\0' ' ' < "/proc/$holder/cmdline" 2>/dev/null || true)"
+      die "unable to acquire codex-tool manager lock within ${LOCK_TIMEOUT}s; holder PID $holder: ${holder_cmd:-unknown command}"
+    fi
+    die "unable to acquire codex-tool manager lock within ${LOCK_TIMEOUT}s; another codex-tool mutation may still be running"
+  fi
+
+  ( umask 077; printf '%s\n' "$" > "$MANAGER_PID_FILE" )
 }
 
 make_work_dir() {
@@ -1473,9 +1529,15 @@ auth_logout() {
   [[ -z "${GITHUB_TOKEN:-}" ]] || warn "GITHUB_TOKEN is still set in the current environment and will continue to take precedence."
 }
 
-main() {
+init_install_mutation() {
   ensure_supported_platform
-  need_cmd curl; need_cmd python3; need_cmd tar; need_cmd sha256sum; need_cmd find; need_cmd sort; need_cmd stat
+  need_cmd curl
+  need_cmd python3
+  need_cmd tar
+  need_cmd sha256sum
+  need_cmd find
+  need_cmd sort
+  need_cmd stat
   init_curl_compat
   validate_uint CODEX_TOOL_API_TIMEOUT "$API_TIMEOUT"
   validate_uint CODEX_TOOL_CONNECT_TIMEOUT "$CONNECT_TIMEOUT"
@@ -1486,62 +1548,153 @@ main() {
   ensure_layout
   lock_manager
   ensure_command_links
+}
 
+init_manager_mutation() {
+  ensure_supported_platform
+  need_cmd python3
+  need_cmd find
+  need_cmd sort
+  need_cmd stat
+  ensure_layout
+  lock_manager
+  ensure_command_links
+}
+
+init_github_auth() {
+  need_cmd curl
+  need_cmd python3
+  init_curl_compat
+  validate_uint CODEX_TOOL_API_TIMEOUT "$API_TIMEOUT"
+  validate_uint CODEX_TOOL_CONNECT_TIMEOUT "$CONNECT_TIMEOUT"
+}
+
+main() {
   local cmd="${1:-help}"
+
+  # Fast read-only paths deliberately avoid manager layout creation, link repair,
+  # network dependency checks, and the exclusive manager lock.
+  case "$cmd" in
+    version|--version|-V)
+      [[ $# -eq 1 ]] || die "usage: codex-tool version"
+      printf 'codex-tool %s\n' "$TOOL_VERSION"
+      return 0
+      ;;
+    help|-h|--help)
+      [[ $# -eq 1 ]] || die "usage: codex-tool help"
+      usage
+      return 0
+      ;;
+    list)
+      [[ $# -eq 1 ]] || die "usage: codex-tool list"
+      ensure_supported_platform
+      need_cmd find
+      need_cmd sort
+      list_versions
+      return 0
+      ;;
+  esac
+
   case "$cmd" in
     install)
       [[ $# -eq 2 ]] || die "usage: codex-tool install X.Y.Z"
-      install_version "$2" ;;
+      init_install_mutation
+      install_version "$2"
+      ;;
     update)
       [[ $# -eq 1 ]] || die "usage: codex-tool update"
-      local latest; latest="$(latest_stable_version)"
+      init_install_mutation
+      local latest
+      latest="$(latest_stable_version)"
       log "latest stable Codex version: $latest"
-      install_version "$latest" ;;
+      install_version "$latest"
+      ;;
     delete)
       [[ $# -eq 2 ]] || die "usage: codex-tool delete X.Y.Z"
-      delete_version "$2" ;;
+      init_manager_mutation
+      delete_version "$2"
+      ;;
     switch)
       [[ $# -eq 2 ]] || die "usage: codex-tool switch X.Y.Z"
-      switch_version "$2" ;;
-    list)
-      [[ $# -eq 1 ]] || die "usage: codex-tool list"
-      list_versions ;;
+      init_manager_mutation
+      switch_version "$2"
+      ;;
     clean)
-      local yes=0; shift
-      while (($#)); do case "$1" in --yes|-y) yes=1;; *) die "unknown clean option: $1";; esac; shift; done
-      clean_data "$yes" ;;
+      init_manager_mutation
+      local yes=0
+      shift
+      while (($#)); do
+        case "$1" in
+          --yes|-y) yes=1 ;;
+          *) die "unknown clean option: $1" ;;
+        esac
+        shift
+      done
+      clean_data "$yes"
+      ;;
     prune)
-      local yes=0 force=0; shift
-      while (($#)); do case "$1" in --yes|-y) yes=1;; --force) force=1;; *) die "unknown prune option: $1";; esac; shift; done
-      prune_all "$yes" "$force" ;;
+      init_manager_mutation
+      local yes=0 force=0
+      shift
+      while (($#)); do
+        case "$1" in
+          --yes|-y) yes=1 ;;
+          --force) force=1 ;;
+          *) die "unknown prune option: $1" ;;
+        esac
+        shift
+      done
+      prune_all "$yes" "$force"
+      ;;
     daemon)
       [[ $# -ge 2 ]] || die "usage: codex-tool daemon {status|repair [--yes]}"
       case "$2" in
         status)
           [[ $# -eq 2 ]] || die "usage: codex-tool daemon status"
+          ensure_supported_platform
+          need_cmd python3
+          need_cmd stat
           daemon_status
           ;;
         repair)
+          init_manager_mutation
           local yes=0
           shift 2
-          while (($#)); do case "$1" in --yes|-y) yes=1;; *) die "unknown daemon repair option: $1";; esac; shift; done
+          while (($#)); do
+            case "$1" in
+              --yes|-y) yes=1 ;;
+              *) die "unknown daemon repair option: $1" ;;
+            esac
+            shift
+          done
           daemon_repair "$yes"
           ;;
-        *) die "usage: codex-tool daemon {status|repair [--yes]}" ;;
-      esac ;;
+        *)
+          die "usage: codex-tool daemon {status|repair [--yes]}"
+          ;;
+      esac
+      ;;
     auth)
       [[ $# -eq 2 ]] || die "usage: codex-tool auth {login|status|logout}"
       case "$2" in
-        login) auth_login ;;
-        status) auth_status ;;
-        logout) auth_logout ;;
-        *) die "usage: codex-tool auth {login|status|logout}" ;;
-      esac ;;
-    version|--version|-V)
-      printf 'codex-tool %s\n' "$TOOL_VERSION" ;;
-    help|-h|--help)
-      usage ;;
-    *) die "unknown command: $cmd (run 'codex-tool help')" ;;
+        login)
+          init_github_auth
+          auth_login
+          ;;
+        status)
+          auth_status
+          ;;
+        logout)
+          auth_logout
+          ;;
+        *)
+          die "usage: codex-tool auth {login|status|logout}"
+          ;;
+      esac
+      ;;
+    *)
+      die "unknown command: $cmd (run 'codex-tool help')"
+      ;;
   esac
 }
 

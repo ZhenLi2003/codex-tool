@@ -13,7 +13,7 @@
 - **安装完整运行时**：使用完整 Codex package，包括 `codex-code-mode-host` 等现代组件。
 - **保留用户数据**：`~/.codex` 与程序版本分离，切换和升级不会清空用户配置。
 - **适合不稳定网络**：大文件支持断点续传、自动重试和 SHA-256 校验。
-- **自动处理部分 GitHub API 限流场景**：如果 GitHub 明确返回 API quota 耗尽，工具会仅针对该元数据请求尝试一次绕过代理直连，不改变后续大文件下载的网络配置。
+- **自动处理 GitHub API 限流场景**：如果共享代理出口耗尽匿名 API 配额，工具会先尝试直连；若直连不可用，则在交互终端中引导创建 GitHub access token，隐藏输入并验证后，以 `0600` 权限保存，后续 API 请求自动复用。
 
 > `codex-tool` 是社区工具，并非 OpenAI 官方项目。
 
@@ -96,6 +96,9 @@ codex-tool clean [--yes]          清理 Codex 数据，但保留 config.toml �
 codex-tool prune [--yes] [--force]
                                   删除所有受管理的 Codex 版本、下载缓存和 codex 命令链接
 codex-tool version                查看 codex-tool 版本
+codex-tool auth login             保存并验证 GitHub access token
+codex-tool auth status            查看当前 GitHub 认证来源
+codex-tool auth logout            删除 codex-tool 保存的 token
 codex-tool help                   查看帮助
 ```
 
@@ -156,6 +159,27 @@ Codex 用户配置和运行数据仍保存在：
 ```
 
 升级管理器、安装新版本或切换版本都不会自动清空该目录。
+
+## GitHub API 认证与限流恢复
+
+GitHub 未认证 REST API 会按源 IP 限流，共享实验室代理或公共出口比较容易耗尽匿名配额。
+
+当检测到明确的匿名 API rate limit 后，codex-tool 会：
+1. 先仅针对该 API 元数据请求尝试绕过代理直连；
+2. 如果直连失败且当前是交互终端，显示 GitHub token 创建网址；
+3. 以隐藏方式读取 token，使用当前正常代理路径验证其能访问公开的 `openai/codex` release API；
+4. 验证成功后保存到 `~/.config/codex-tool/github-token`，文件权限为 `0600`；
+5. 后续 API 请求自动使用该 token，从而使用认证后的 GitHub API 配额。
+
+也可以手动管理：
+
+```bash
+codex-tool auth login
+codex-tool auth status
+codex-tool auth logout
+```
+
+如设置了环境变量 `GITHUB_TOKEN`，其优先级高于工具保存的 token。
 
 ## 文档
 

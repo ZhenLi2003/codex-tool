@@ -148,7 +148,7 @@ Default behavior:
 
 With `--all`, active threads are interrupted first. codex-tool finds an in-progress turn through `thread/turns/list`, requests `turn/interrupt`, waits for the thread to leave `active`, then deletes the persisted thread.
 
-If an active thread cannot be interrupted safely, `clean --all` fails instead of stopping the whole daemon or deleting backing files underneath it.
+If the online interrupt/delete pass cannot remove every thread because managed live/internal state is still holding ownership, `clean --all` establishes a final boundary by temporarily stopping the managed daemon, retries cleanup through an isolated stdio app-server, then restores the daemon. An unmanaged app-server is never stopped automatically.
 
 #### prune
 

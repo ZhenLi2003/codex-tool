@@ -11,9 +11,9 @@ A lightweight version manager for the OpenAI Codex CLI standalone package on **L
 - **Simple installation** — only two project scripts are involved: `install.sh` and `codex-tool`.
 - **Version switching** — keep multiple Codex versions side by side and switch instantly.
 - **Complete modern runtime** — installs the full Codex package, including components such as `codex-code-mode-host`.
-- **Daemon-aware lifecycle** — version activation stops/restores the managed app-server daemon safely, and `clean` no longer deletes daemon state or packages.
+- **Daemon-aware lifecycle** — version activation coordinates with the managed app-server daemon; session cleanup uses Codex's official app-server APIs instead of deleting `CODEX_HOME` internals.
 - **Non-blocking read-only commands** — `version`, `help`, `list`, `auth status`, and `daemon status` do not take the exclusive manager lock.
-- **User data preserved** — `~/.codex` configuration, authentication, managed daemon packages, and unknown future state are preserved unless explicitly owned by codex-tool.
+- **User data ownership respected** — codex-tool manages its own CLI versions directly and asks Codex to manage persisted threads through app-server RPC.
 - **Resilient downloads** — large release packages support persistent resume/retry and SHA-256 verification.
 - **GitHub API rate-limit recovery** — if an anonymous proxy exit exhausts GitHub's API quota, codex-tool first retries the metadata request directly; if direct access is unavailable, it can guide you to create a GitHub access token, verify it, save it with mode `0600`, and reuse it for future API requests.
 
@@ -87,11 +87,14 @@ codex-tool update                 Install/activate the latest stable version
 codex-tool list                   Show current and locally installed versions
 codex-tool switch X.Y.Z           Switch to an installed version
 codex-tool delete X.Y.Z           Delete an installed non-current version
-codex-tool clean [--yes]          Clear known history/log data only; preserve config,
-                                  auth, daemon state/packages, and unknown entries
-codex-tool prune [--yes] [--force]
-                                  Stop managed daemon if needed, then remove all
-                                  codex-tool-managed versions/cache and codex link
+codex-tool clean [--all] [--dry-run] [--yes]
+                                  Delete persisted sessions through the Codex app-server.
+                                  Default: inactive threads only; --all also interrupts
+                                  and deletes active/background threads.
+codex-tool prune [--dry-run] [--yes] [--force]
+                                  Delete loaded/background threads, stop the daemon,
+                                  and remove Codex program/runtime assets while
+                                  preserving inactive saved history and user config/auth
 codex-tool version                Show codex-tool version
 codex-tool daemon status          Inspect app-server daemon state
 codex-tool daemon repair [--yes]  Repair stale managed daemon runtime state
@@ -155,23 +158,55 @@ Updating the manager or switching Codex versions does not clear that directory.
 
 ## Daemon-aware lifecycle
 
-Modern Codex can run a managed background app-server under `CODEX_HOME`. codex-tool 1.7.0 treats that daemon as an independent lifecycle-managed component:
+Modern Codex uses a long-lived app-server, persisted thread storage, SQLite-backed state, writer locks, and managed daemon packages. codex-tool 1.8.0 no longer treats `CODEX_HOME` as a cache directory.
 
-- `install`, `update`, and `switch` perform downloads/verification first, then stop a healthy managed daemon only for the activation transaction and restore it afterward.
-- If daemon restoration fails, the selected CLI remains active, previous versions are retained, and codex-tool reports the failure instead of deleting recovery options.
-- `prune` stops a managed daemon and intentionally leaves it stopped while preserving `CODEX_HOME/packages/app-server-daemon` and daemon settings/state.
-- `clean` uses a delete allowlist. It removes only known history/log data: `sessions/`, `archived_sessions/`, `history.jsonl`, and `log/`.
-- `clean` never wipes the whole `CODEX_HOME`, so `config.toml`, `auth.json`, daemon state, packages, and unknown future Codex entries are preserved.
-- Running Codex processes protect their version directories from `delete`, automatic history pruning, replacement, and `prune`.
+For `install`, `update`, and `switch`, codex-tool keeps the existing daemon running during download and package verification, then stops/restores a healthy managed daemon only around version activation.
 
-Diagnostics and stale-state recovery:
+For session cleanup, codex-tool uses the official app-server JSON-RPC methods rather than deleting rollout files or SQLite databases directly:
+
+```text
+thread/list
+thread/read
+thread/loaded/list
+thread/turns/list
+turn/interrupt
+thread/delete
+```
+
+### clean
+
+```bash
+codex-tool clean --dry-run
+codex-tool clean
+codex-tool clean --all
+```
+
+Default `clean` deletes persisted threads whose current status is not active. Healthy background app-server/daemon processes stay running.
+
+`clean --all` additionally requests `turn/interrupt` for active threads, waits for them to leave the active state, then deletes their persisted thread records through `thread/delete`.
+
+No clean mode directly removes `sessions/`, `archived_sessions/`, `thread_history_*.sqlite`, `state_*.sqlite`, or Codex lock files.
+
+### prune
+
+`prune` is the program/runtime cleanup operation. It:
+
+1. discovers loaded/background threads through app-server;
+2. requests interruption for active turns;
+3. stops the managed daemon;
+4. deletes persisted records for the previously loaded/background threads through a temporary stdio app-server;
+5. removes codex-tool-managed CLI versions, current/download cache, the managed `codex` command, managed daemon/standalone packages, and daemon runtime state.
+
+It preserves inactive saved thread history and user-owned configuration/authentication/skills/rules.
+
+Foreground Codex processes using managed binaries cause prune to fail closed rather than deleting executables beneath a running process.
+
+Diagnostics and stale-state recovery remain available:
 
 ```bash
 codex-tool daemon status
 codex-tool daemon repair
 ```
-
-The normal lifecycle commands fail closed when daemon state is stale/unknown or when an unmanaged app-server is running. `daemon repair` is the explicit recovery path for stale managed daemon runtime state.
 
 ## GitHub API authentication
 
@@ -207,6 +242,8 @@ codex-tool daemon status
 Mutation commands use a host-local runtime lock under `$XDG_RUNTIME_DIR/codex-tool` when available, otherwise `/tmp/codex-tool-$UID`. The lock directory must be owned by the current user and is forced to mode `0700`.
 
 Lock acquisition is bounded by `CODEX_TOOL_LOCK_TIMEOUT` (default: 10 seconds). If another mutation still holds the lock, codex-tool reports the holder PID/command when available instead of waiting indefinitely.
+
+In 1.8.0, every Codex subprocess that can start or communicate with a long-lived daemon explicitly closes the manager-lock file descriptor before exec. The codex-tool parent also explicitly unlocks/closes it on exit. This prevents app-server or updater descendants from accidentally keeping the codex-tool `flock` alive after the manager exits.
 
 ## Documentation
 

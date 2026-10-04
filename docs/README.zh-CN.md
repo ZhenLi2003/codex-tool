@@ -166,8 +166,8 @@ GitHub 未认证 REST API 会按源 IP 限流，共享实验室代理或公共�
 
 当检测到明确的匿名 API rate limit 后，codex-tool 会：
 1. 先仅针对该 API 元数据请求尝试绕过代理直连；
-2. 如果直连失败且当前是交互终端，显示 GitHub token 创建网址；
-3. 以隐藏方式读取 token，使用当前正常代理路径验证其能访问公开的 `openai/codex` release API；
+2. 如果直连失败且当前是交互终端，显示预填充的 GitHub fine-grained token 创建网址；
+3. 只要求仓库 `Contents: read`，以隐藏方式读取 token，并使用当前正常代理路径验证其能访问公开的 `openai/codex` release API；
 4. 验证成功后保存到 `~/.config/codex-tool/github-token`，文件权限为 `0600`；
 5. 后续 API 请求自动使用该 token，从而使用认证后的 GitHub API 配额。
 

@@ -13,7 +13,7 @@ A lightweight version manager for the OpenAI Codex CLI standalone package on **L
 - **Complete modern runtime** — installs the full Codex package, including components such as `codex-code-mode-host`.
 - **User data preserved** — `~/.codex` is kept separate from managed program versions.
 - **Resilient downloads** — large release packages support persistent resume/retry and SHA-256 verification.
-- **GitHub API rate-limit fallback** — when GitHub explicitly reports API quota exhaustion, the metadata request is retried once without proxy use while normal asset downloads keep the user's network configuration.
+- **GitHub API rate-limit recovery** — if an anonymous proxy exit exhausts GitHub's API quota, codex-tool first retries the metadata request directly; if direct access is unavailable, it can guide you to create a GitHub access token, verify it, save it with mode `0600`, and reuse it for future API requests.
 
 > `codex-tool` is a community utility and is not an official OpenAI project.
 
@@ -90,6 +90,9 @@ codex-tool prune [--yes] [--force]
                                   Remove all managed Codex versions/download cache
                                   and the managed codex command link
 codex-tool version                Show codex-tool version
+codex-tool auth login             Save and verify a GitHub access token
+codex-tool auth status            Show the active GitHub auth source
+codex-tool auth logout            Remove the token saved by codex-tool
 codex-tool help                   Show built-in help
 ```
 
@@ -144,6 +147,25 @@ Codex configuration and runtime data remain in:
 ```
 
 Updating the manager or switching Codex versions does not clear that directory.
+
+## GitHub API authentication
+
+Anonymous GitHub REST API requests are rate-limited per source IP. This is often visible on shared laboratory or proxy egress addresses.
+
+When an anonymous request is rate-limited, codex-tool:
+1. retries that API metadata request once without proxy use;
+2. if direct access fails and the shell is interactive, shows the GitHub token creation URL;
+3. accepts the token with hidden input, verifies it against the public `openai/codex` release API, and stores it at `~/.config/codex-tool/github-token` with mode `0600`.
+
+You can manage the saved token explicitly:
+
+```bash
+codex-tool auth login
+codex-tool auth status
+codex-tool auth logout
+```
+
+`GITHUB_TOKEN`, when set, takes precedence over the saved token.
 
 ## Documentation
 

@@ -44,12 +44,21 @@ PRELOCK_ACTIVE_IDS_FILE=""
 PRELOCK_ACTIVE_CAPTURE_FAILED=0
 PRELOCK_LOADED_IDS_FILE=""
 PRELOCK_LOADED_CAPTURE_FAILED=0
+RESTORE_DAEMON_ON_EXIT=0
 
 log()  { printf '==> %s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 cleanup() {
+  local original_rc=$?
+
+  if (( RESTORE_DAEMON_ON_EXIT )); then
+    warn "restoring managed Codex app-server after an interrupted legacy-lock recovery"
+    DAEMON_WAS_RUNNING=1
+    daemon_restore_after_mutation || warn "unable to restore managed Codex app-server during exit cleanup"
+  fi
+
   if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then
     rm -rf -- "$WORK_DIR"
   fi
@@ -62,6 +71,8 @@ cleanup() {
     flock -u 9 2>/dev/null || true
     exec 9>&-
   fi
+
+  return "$original_rc"
 }
 trap cleanup EXIT
 
@@ -296,6 +307,7 @@ recover_daemon_inherited_manager_lock() {
   fi
 
   rm -f -- "$(dirname "$lock_file")/manager.pid"
+  RESTORE_DAEMON_ON_EXIT=1
   log "released legacy daemon-held codex-tool manager lock"
   return 0
 }
@@ -1011,6 +1023,7 @@ daemon_restore_after_mutation() {
     started|alreadyRunning|running|restarted)
       log "managed Codex app-server daemon restored"
       PRELOCK_DAEMON_WAS_RUNNING=0
+      RESTORE_DAEMON_ON_EXIT=0
       return 0
       ;;
     *)
@@ -2337,6 +2350,7 @@ prune_all() {
   rm -rf --     "$CODEX_DATA_DIR/packages/app-server-daemon"     "$CODEX_DATA_DIR/packages/standalone"     "$CODEX_DATA_DIR/app-server-daemon"     "$CODEX_DATA_DIR/app-server-control"
 
   PRELOCK_DAEMON_WAS_RUNNING=0
+  RESTORE_DAEMON_ON_EXIT=0
 
   if (( purge_history )); then
     log "pruned Codex program/runtime assets and purged persisted session history"

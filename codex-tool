@@ -1238,9 +1238,13 @@ write_session_admin_script() {
 
   cat > "$script" <<'PY'
 import argparse
+import base64
+import hashlib
 import json
 import os
 import select
+import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -1254,39 +1258,46 @@ class RpcError(RuntimeError):
 
 class Client:
     def __init__(self, codex, transport, socket_path=None):
+        self.transport = transport
+        self.proc = None
+        self.sock = None
+        self.stderr_lines = []
+        self.next_id = 1
+
         if transport == "uds":
             if not socket_path:
                 raise RuntimeError("missing daemon socket path")
-            args = [codex, "stdio-to-uds", socket_path]
+            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.sock.settimeout(15)
+            self.sock.connect(socket_path)
+            self._ws_handshake()
         else:
             args = [codex, "app-server", "--listen", "stdio://"]
+            self.proc = subprocess.Popen(
+                args,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                bufsize=1,
+                close_fds=True,
+                env=os.environ.copy(),
+            )
+            if self.proc.stdin is None or self.proc.stdout is None:
+                raise RuntimeError("failed to open Codex app-server pipes")
 
-        self.stderr_lines = []
-        self.proc = subprocess.Popen(
-            args,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            bufsize=1,
-            close_fds=True,
-            env=os.environ.copy(),
-        )
-        if self.proc.stdin is None or self.proc.stdout is None:
-            raise RuntimeError("failed to open Codex app-server pipes")
+            def drain_stderr():
+                if self.proc.stderr is None:
+                    return
+                for line in self.proc.stderr:
+                    self.stderr_lines.append(line.rstrip())
+                    if len(self.stderr_lines) > 100:
+                        del self.stderr_lines[:20]
 
-        def drain_stderr():
-            if self.proc.stderr is None:
-                return
-            for line in self.proc.stderr:
-                self.stderr_lines.append(line.rstrip())
-                if len(self.stderr_lines) > 100:
-                    del self.stderr_lines[:20]
+            self.stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+            self.stderr_thread.start()
 
-        self.stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
-        self.stderr_thread.start()
-        self.next_id = 1
         self.request("initialize", {
             "clientInfo": {
                 "name": "codex-tool",
@@ -1297,8 +1308,122 @@ class Client:
         }, timeout=15)
         self.notify("initialized", None)
 
+    def _recv_exact(self, count):
+        data = bytearray()
+        while len(data) < count:
+            chunk = self.sock.recv(count - len(data))
+            if not chunk:
+                raise RuntimeError("daemon control socket closed unexpectedly")
+            data.extend(chunk)
+        return bytes(data)
+
+    def _ws_handshake(self):
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        request = (
+            "GET /rpc HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+            "\r\n"
+        ).encode("ascii")
+        self.sock.sendall(request)
+
+        response = bytearray()
+        while b"\r\n\r\n" not in response:
+            if len(response) > 65536:
+                raise RuntimeError("oversized WebSocket handshake response")
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise RuntimeError("daemon closed during WebSocket handshake")
+            response.extend(chunk)
+
+        header_blob, extra = bytes(response).split(b"\r\n\r\n", 1)
+        if extra:
+            raise RuntimeError("unexpected WebSocket payload during handshake")
+        lines = header_blob.decode("iso-8859-1").split("\r\n")
+        if not lines or " 101 " not in f" {lines[0]} ":
+            raise RuntimeError(f"daemon WebSocket handshake failed: {lines[0] if lines else 'empty response'}")
+        headers = {}
+        for line in lines[1:]:
+            if ":" in line:
+                name, value = line.split(":", 1)
+                headers[name.strip().lower()] = value.strip()
+        expected = base64.b64encode(
+            hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()
+        ).decode("ascii")
+        if headers.get("sec-websocket-accept") != expected:
+            raise RuntimeError("daemon WebSocket handshake returned an invalid accept key")
+
+    def _ws_send_frame(self, opcode, payload=b""):
+        if isinstance(payload, str):
+            payload = payload.encode("utf-8")
+        mask = os.urandom(4)
+        length = len(payload)
+        first = 0x80 | opcode
+        if length < 126:
+            header = bytes([first, 0x80 | length])
+        elif length <= 0xFFFF:
+            header = bytes([first, 0x80 | 126]) + struct.pack("!H", length)
+        else:
+            header = bytes([first, 0x80 | 127]) + struct.pack("!Q", length)
+        masked = bytes(byte ^ mask[i % 4] for i, byte in enumerate(payload))
+        self.sock.sendall(header + mask + masked)
+
+    def _ws_recv_message(self, timeout):
+        self.sock.settimeout(timeout)
+        fragments = bytearray()
+        text_message = False
+        while True:
+            head = self._recv_exact(2)
+            fin = bool(head[0] & 0x80)
+            opcode = head[0] & 0x0F
+            masked = bool(head[1] & 0x80)
+            length = head[1] & 0x7F
+            if length == 126:
+                length = struct.unpack("!H", self._recv_exact(2))[0]
+            elif length == 127:
+                length = struct.unpack("!Q", self._recv_exact(8))[0]
+            mask = self._recv_exact(4) if masked else None
+            payload = self._recv_exact(length) if length else b""
+            if mask:
+                payload = bytes(byte ^ mask[i % 4] for i, byte in enumerate(payload))
+
+            if opcode == 0x8:
+                raise RuntimeError("daemon closed the WebSocket connection")
+            if opcode == 0x9:
+                self._ws_send_frame(0xA, payload)
+                continue
+            if opcode == 0xA:
+                continue
+            if opcode == 0x1:
+                fragments = bytearray(payload)
+                text_message = True
+            elif opcode == 0x0 and text_message:
+                fragments.extend(payload)
+            else:
+                continue
+
+            if fin:
+                return fragments.decode("utf-8")
+
     def close(self):
+        if self.transport == "uds":
+            if self.sock is not None:
+                try:
+                    self._ws_send_frame(0x8, b"")
+                except Exception:
+                    pass
+                try:
+                    self.sock.close()
+                except Exception:
+                    pass
+            return
+
         proc = self.proc
+        if proc is None:
+            return
         try:
             if proc.stdin:
                 proc.stdin.close()
@@ -1315,10 +1440,40 @@ class Client:
                     pass
 
     def _write(self, msg):
-        if self.proc.stdin is None:
+        payload = json.dumps(msg, separators=(",", ":"))
+        if self.transport == "uds":
+            self._ws_send_frame(0x1, payload)
+            return
+        if self.proc is None or self.proc.stdin is None:
             raise RuntimeError("app-server stdin is closed")
-        self.proc.stdin.write(json.dumps(msg, separators=(",", ":")) + "\n")
+        self.proc.stdin.write(payload + "\n")
         self.proc.stdin.flush()
+
+    def _read_json(self, timeout):
+        if self.transport == "uds":
+            raw = self._ws_recv_message(timeout)
+            return json.loads(raw)
+
+        deadline = time.monotonic() + timeout
+        fd = self.proc.stdout.fileno()
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("timed out waiting for app-server response")
+            ready, _, _ = select.select([fd], [], [], remaining)
+            if not ready:
+                raise RuntimeError("timed out waiting for app-server response")
+            line = self.proc.stdout.readline()
+            if line == "":
+                stderr = " | ".join(self.stderr_lines[-10:])
+                raise RuntimeError(
+                    "Codex app-server closed unexpectedly"
+                    + (f": {stderr}" if stderr else "")
+                )
+            try:
+                return json.loads(line)
+            except json.JSONDecodeError:
+                continue
 
     def notify(self, method, params=None):
         msg = {"method": method}
@@ -1335,25 +1490,25 @@ class Client:
         self._write(msg)
 
         deadline = time.monotonic() + timeout
-        fd = self.proc.stdout.fileno()
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise RuntimeError(f"timed out waiting for {method}")
-            ready, _, _ = select.select([fd], [], [], remaining)
-            if not ready:
-                raise RuntimeError(f"timed out waiting for {method}")
-            line = self.proc.stdout.readline()
-            if line == "":
-                stderr = " | ".join(self.stderr_lines[-10:])
-                raise RuntimeError(
-                    f"Codex app-server closed while waiting for {method}"
-                    + (f": {stderr}" if stderr else "")
-                )
-            try:
-                reply = json.loads(line)
-            except json.JSONDecodeError:
+            reply = self._read_json(remaining)
+
+            # Codex can issue server requests on the same channel. Session
+            # administration does not service interactive approval callbacks;
+            # reject any unexpected request so the server cannot wait on us.
+            if "id" in reply and "method" in reply:
+                self._write({
+                    "id": reply["id"],
+                    "error": {
+                        "code": -32601,
+                        "message": f"codex-tool does not handle server request {reply.get('method')}",
+                    },
+                })
                 continue
+
             if reply.get("id") != rid:
                 continue
             if "error" in reply:

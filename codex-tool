@@ -42,6 +42,8 @@ MANAGER_PID_FILE=""
 PRELOCK_DAEMON_WAS_RUNNING=0
 PRELOCK_ACTIVE_IDS_FILE=""
 PRELOCK_ACTIVE_CAPTURE_FAILED=0
+PRELOCK_LOADED_IDS_FILE=""
+PRELOCK_LOADED_CAPTURE_FAILED=0
 
 log()  { printf '==> %s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
@@ -237,16 +239,24 @@ wait_manager_lock_free() {
   return 1
 }
 
-capture_active_threads_before_prelock_stop() {
+capture_threads_before_prelock_stop() {
   make_work_dir
+
   PRELOCK_ACTIVE_IDS_FILE="$WORK_DIR/prelock-active-threads.txt"
   : > "$PRELOCK_ACTIVE_IDS_FILE"
   if ! session_admin_run capture-active 0 "$PRELOCK_ACTIVE_IDS_FILE" auto; then
     PRELOCK_ACTIVE_CAPTURE_FAILED=1
     warn "could not snapshot active threads before stopping a legacy lock-holding daemon"
-    return 1
   fi
-  return 0
+
+  PRELOCK_LOADED_IDS_FILE="$WORK_DIR/prelock-loaded-threads.txt"
+  : > "$PRELOCK_LOADED_IDS_FILE"
+  if ! session_admin_run capture-loaded 0 "$PRELOCK_LOADED_IDS_FILE" auto; then
+    PRELOCK_LOADED_CAPTURE_FAILED=1
+    warn "could not snapshot loaded/background threads before stopping a legacy lock-holding daemon"
+  fi
+
+  (( PRELOCK_ACTIVE_CAPTURE_FAILED == 0 && PRELOCK_LOADED_CAPTURE_FAILED == 0 ))
 }
 
 recover_daemon_inherited_manager_lock() {
@@ -271,7 +281,7 @@ recover_daemon_inherited_manager_lock() {
   warn "legacy lock holder PID(s): $(tr '\n' ' ' <<<"$pids" | sed 's/[[:space:]]\+/ /g')"
 
   PRELOCK_DAEMON_WAS_RUNNING=1
-  capture_active_threads_before_prelock_stop || true
+  capture_threads_before_prelock_stop || true
 
   if ! stop_app_server_internal "legacy manager-lock recovery"; then
     warn "unable to stop the managed daemon holding the legacy manager lock"
@@ -855,8 +865,8 @@ stop_app_server_internal() {
   case "$DAEMON_STATE" in
     running)
       make_work_dir
-      local out="$WORK_DIR/daemon-stop.$.json"
-      local err="$WORK_DIR/daemon-stop.$.stderr"
+      local out="$WORK_DIR/daemon-stop.$$.json"
+      local err="$WORK_DIR/daemon-stop.$$.stderr"
       log "stopping managed Codex app-server ($reason)"
       if daemon_lifecycle "$DAEMON_BIN" stop "$out" "$err"; then
         local status
@@ -1854,7 +1864,7 @@ def main():
     parser.add_argument("--socket")
     parser.add_argument(
         "--mode",
-        choices=("scan-clean", "capture-active", "clean", "clean-stopped", "scan-prune", "prepare-prune", "delete-ids"),
+        choices=("scan-clean", "capture-active", "capture-loaded", "clean", "clean-stopped", "scan-prune", "prepare-prune", "delete-ids"),
         required=True,
     )
     parser.add_argument("--all", action="store_true")
@@ -1863,6 +1873,12 @@ def main():
 
     client = Client(args.codex, args.transport, args.socket)
     try:
+        if args.mode == "capture-loaded":
+            loaded = list_loaded_ids(client)
+            write_ids(args.ids_file, loaded)
+            print(f"Captured loaded/background thread IDs: {len(loaded)}")
+            return 0
+
         if args.mode in ("scan-clean", "capture-active", "clean", "clean-stopped"):
             threads = list_threads(client)
             print_clean_scan(threads, args.all)

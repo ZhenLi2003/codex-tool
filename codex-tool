@@ -1199,45 +1199,558 @@ confirm_or_die() {
   [[ "$ans" =~ ^[Yy]([Ee][Ss])?$ ]] || die "cancelled"
 }
 
-clean_known_user_data() {
-  local rc=0 path
-  for path in \
-    "$CODEX_DATA_DIR/sessions" \
-    "$CODEX_DATA_DIR/archived_sessions" \
-    "$CODEX_DATA_DIR/history.jsonl" \
-    "$CODEX_DATA_DIR/log"
+session_admin_binary() {
+  local candidate managed cv
+  if [[ -n "$DAEMON_LAST_JSON" && -s "$DAEMON_LAST_JSON" ]]; then
+    managed="$(daemon_json_field "$DAEMON_LAST_JSON" managedCodexPath)"
+    if [[ -n "$managed" && -x "$managed" ]]; then
+      printf '%s\n' "$managed"
+      return 0
+    fi
+  fi
+
+  cv="$(current_version 2>/dev/null || true)"
+  if [[ -n "$cv" ]]; then
+    candidate="$(version_codex_path "$cv" 2>/dev/null || true)"
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  fi
+
+  for candidate in \
+    "$CODEX_COMMAND" \
+    "$CODEX_DATA_DIR/packages/app-server-daemon/current/bin/codex" \
+    "$CODEX_DATA_DIR/packages/standalone/current/bin/codex"
   do
-    [[ -e "$path" || -L "$path" ]] || continue
-    if ! rm -rf -- "$path"; then
-      warn "failed to remove $path"
-      rc=1
+    if [[ -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
     fi
   done
-  return "$rc"
+  return 1
+}
+
+write_session_admin_script() {
+  make_work_dir
+  local script="$WORK_DIR/session-admin.py"
+  [[ -f "$script" ]] && { printf '%s\n' "$script"; return 0; }
+
+  cat > "$script" <<'PY'
+import argparse
+import json
+import os
+import select
+import subprocess
+import sys
+import threading
+import time
+
+class RpcError(RuntimeError):
+    def __init__(self, method, error):
+        self.method = method
+        self.error = error if isinstance(error, dict) else {"message": str(error)}
+        super().__init__(f"{method}: {self.error.get('message', self.error)}")
+
+class Client:
+    def __init__(self, codex, transport, socket_path=None):
+        if transport == "uds":
+            if not socket_path:
+                raise RuntimeError("missing daemon socket path")
+            args = [codex, "stdio-to-uds", socket_path]
+        else:
+            args = [codex, "app-server", "--listen", "stdio://"]
+
+        self.stderr_lines = []
+        self.proc = subprocess.Popen(
+            args,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            bufsize=1,
+            close_fds=True,
+            env=os.environ.copy(),
+        )
+        if self.proc.stdin is None or self.proc.stdout is None:
+            raise RuntimeError("failed to open Codex app-server pipes")
+
+        def drain_stderr():
+            if self.proc.stderr is None:
+                return
+            for line in self.proc.stderr:
+                self.stderr_lines.append(line.rstrip())
+                if len(self.stderr_lines) > 100:
+                    del self.stderr_lines[:20]
+
+        self.stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+        self.stderr_thread.start()
+        self.next_id = 1
+        self.request("initialize", {
+            "clientInfo": {
+                "name": "codex-tool",
+                "title": "codex-tool session manager",
+                "version": "1.8.0",
+            },
+            "capabilities": {"experimentalApi": True},
+        }, timeout=15)
+        self.notify("initialized", None)
+
+    def close(self):
+        proc = self.proc
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except Exception:
+            pass
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+    def _write(self, msg):
+        if self.proc.stdin is None:
+            raise RuntimeError("app-server stdin is closed")
+        self.proc.stdin.write(json.dumps(msg, separators=(",", ":")) + "\n")
+        self.proc.stdin.flush()
+
+    def notify(self, method, params=None):
+        msg = {"method": method}
+        if params is not None:
+            msg["params"] = params
+        self._write(msg)
+
+    def request(self, method, params=None, timeout=20):
+        rid = self.next_id
+        self.next_id += 1
+        msg = {"id": rid, "method": method}
+        if params is not None:
+            msg["params"] = params
+        self._write(msg)
+
+        deadline = time.monotonic() + timeout
+        fd = self.proc.stdout.fileno()
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(f"timed out waiting for {method}")
+            ready, _, _ = select.select([fd], [], [], remaining)
+            if not ready:
+                raise RuntimeError(f"timed out waiting for {method}")
+            line = self.proc.stdout.readline()
+            if line == "":
+                stderr = " | ".join(self.stderr_lines[-10:])
+                raise RuntimeError(
+                    f"Codex app-server closed while waiting for {method}"
+                    + (f": {stderr}" if stderr else "")
+                )
+            try:
+                reply = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if reply.get("id") != rid:
+                continue
+            if "error" in reply:
+                raise RpcError(method, reply["error"])
+            return reply.get("result") or {}
+
+def status_type(thread):
+    status = thread.get("status")
+    if isinstance(status, dict):
+        return str(status.get("type") or "unknown")
+    if isinstance(status, str):
+        return status
+    return "unknown"
+
+def list_threads(client):
+    result = []
+    seen = set()
+    for archived in (False, True):
+        cursor = None
+        while True:
+            params = {"archived": archived, "limit": 100}
+            if cursor:
+                params["cursor"] = cursor
+            page = client.request("thread/list", params)
+            for thread in page.get("data") or []:
+                tid = thread.get("id")
+                if tid and tid not in seen:
+                    seen.add(tid)
+                    result.append(thread)
+            cursor = page.get("nextCursor")
+            if not cursor:
+                break
+    return result
+
+def list_loaded_ids(client):
+    result = []
+    seen = set()
+    cursor = None
+    while True:
+        params = {"limit": 100}
+        if cursor:
+            params["cursor"] = cursor
+        page = client.request("thread/loaded/list", params)
+        for item in page.get("data") or []:
+            tid = item if isinstance(item, str) else item.get("id")
+            if tid and tid not in seen:
+                seen.add(tid)
+                result.append(tid)
+        cursor = page.get("nextCursor")
+        if not cursor:
+            break
+    return result
+
+def read_status(client, thread_id):
+    result = client.request(
+        "thread/read",
+        {"threadId": thread_id, "includeTurns": False},
+        timeout=15,
+    )
+    thread = result.get("thread") or {}
+    return status_type(thread)
+
+def in_progress_turn(client, thread_id):
+    page = client.request(
+        "thread/turns/list",
+        {"threadId": thread_id, "limit": 20, "sortDirection": "desc"},
+        timeout=15,
+    )
+    for turn in page.get("data") or []:
+        if turn.get("status") == "inProgress":
+            return turn.get("id")
+    return None
+
+def interrupt_thread(client, thread_id):
+    last_error = None
+    for _ in range(3):
+        try:
+            turn_id = in_progress_turn(client, thread_id)
+        except Exception as exc:
+            last_error = exc
+            turn_id = None
+        if not turn_id:
+            try:
+                return read_status(client, thread_id) != "active"
+            except Exception:
+                return False
+        try:
+            client.request(
+                "turn/interrupt",
+                {"threadId": thread_id, "turnId": turn_id},
+                timeout=15,
+            )
+        except RpcError as exc:
+            last_error = exc
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            time.sleep(0.35)
+            try:
+                if read_status(client, thread_id) != "active":
+                    return True
+            except Exception as exc:
+                last_error = exc
+        time.sleep(0.25)
+    if last_error:
+        print(f"warning: unable to interrupt thread {thread_id}: {last_error}", file=sys.stderr)
+    return False
+
+def delete_many(client, ids):
+    pending = list(dict.fromkeys(ids))
+    deleted = []
+    errors = {}
+    for _pass in range(5):
+        if not pending:
+            break
+        next_pending = []
+        progress = False
+        for tid in pending:
+            try:
+                client.request("thread/delete", {"threadId": tid}, timeout=20)
+                deleted.append(tid)
+                errors.pop(tid, None)
+                progress = True
+            except Exception as exc:
+                errors[tid] = str(exc)
+                next_pending.append(tid)
+        pending = next_pending
+        if not pending:
+            break
+        if not progress:
+            time.sleep(0.75)
+        else:
+            time.sleep(0.25)
+    return deleted, pending, errors
+
+def write_ids(path, ids):
+    if not path:
+        return
+    with open(path, "w", encoding="utf-8") as f:
+        for tid in ids:
+            f.write(tid + "\n")
+
+def read_ids(path):
+    if not path or not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip()]
+
+def print_clean_scan(threads, include_active):
+    active = [t for t in threads if status_type(t) == "active"]
+    inactive = [t for t in threads if status_type(t) != "active"]
+    print(f"Persisted threads: {len(threads)}")
+    print(f"Inactive/deletable candidates: {len(inactive)}")
+    print(f"Active/background threads: {len(active)}")
+    print(f"Would delete: {len(threads) if include_active else len(inactive)}")
+    if active and not include_active:
+        print(f"Would preserve active/background: {len(active)}")
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--codex", required=True)
+    parser.add_argument("--transport", choices=("uds", "stdio"), required=True)
+    parser.add_argument("--socket")
+    parser.add_argument(
+        "--mode",
+        choices=("scan-clean", "clean", "scan-prune", "prepare-prune", "delete-ids"),
+        required=True,
+    )
+    parser.add_argument("--all", action="store_true")
+    parser.add_argument("--ids-file")
+    args = parser.parse_args()
+
+    client = Client(args.codex, args.transport, args.socket)
+    try:
+        if args.mode in ("scan-clean", "clean"):
+            threads = list_threads(client)
+            print_clean_scan(threads, args.all)
+            if args.mode == "scan-clean":
+                return 0
+
+            targets = list(threads) if args.all else [
+                t for t in threads if status_type(t) != "active"
+            ]
+
+            if args.all:
+                active = [t for t in targets if status_type(t) == "active"]
+                failed_interrupts = []
+                for thread in active:
+                    tid = thread["id"]
+                    print(f"==> interrupting active thread {tid}")
+                    if not interrupt_thread(client, tid):
+                        failed_interrupts.append(tid)
+                if failed_interrupts:
+                    print(
+                        "error: active thread(s) could not be interrupted: "
+                        + " ".join(failed_interrupts),
+                        file=sys.stderr,
+                    )
+                    return 2
+
+            ids = [t["id"] for t in targets if t.get("id")]
+            deleted, pending, errors = delete_many(client, ids)
+            print(f"Deleted threads: {len(deleted)}")
+            if pending:
+                print(f"Could not delete: {len(pending)}", file=sys.stderr)
+                for tid in pending:
+                    print(f"warning: {tid}: {errors.get(tid, 'unknown error')}", file=sys.stderr)
+                return 3
+            return 0
+
+        if args.mode in ("scan-prune", "prepare-prune"):
+            threads = {t.get("id"): t for t in list_threads(client) if t.get("id")}
+            loaded = list_loaded_ids(client)
+            active = [
+                tid for tid in loaded
+                if status_type(threads.get(tid, {})) == "active"
+            ]
+            print(f"Loaded/background threads: {len(loaded)}")
+            print(f"Active background threads: {len(active)}")
+
+            if args.mode == "scan-prune":
+                return 0
+
+            write_ids(args.ids_file, loaded)
+            failed = []
+            for tid in active:
+                print(f"==> interrupting background thread {tid}")
+                if not interrupt_thread(client, tid):
+                    failed.append(tid)
+            if failed:
+                print(
+                    "error: background thread(s) could not be interrupted: "
+                    + " ".join(failed),
+                    file=sys.stderr,
+                )
+                return 4
+            return 0
+
+        if args.mode == "delete-ids":
+            ids = read_ids(args.ids_file)
+            if not ids:
+                print("Background thread records to delete: 0")
+                return 0
+            deleted, pending, errors = delete_many(client, ids)
+            print(f"Deleted background thread records: {len(deleted)}")
+            if pending:
+                print(f"Could not delete background thread records: {len(pending)}", file=sys.stderr)
+                for tid in pending:
+                    print(f"warning: {tid}: {errors.get(tid, 'unknown error')}", file=sys.stderr)
+                return 5
+            return 0
+
+        return 2
+    finally:
+        client.close()
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130)
+    except Exception as exc:
+        print(f"error: Codex app-server session management failed: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+PY
+  chmod 0600 "$script"
+  printf '%s\n' "$script"
+}
+
+session_admin_run() {
+  local mode="$1"
+  local all_threads="${2:-0}"
+  local ids_file="${3:-}"
+  local force_transport="${4:-auto}"
+
+  daemon_snapshot
+  local transport socket_path binary script
+  socket_path=""
+
+  if [[ "$force_transport" == "stdio" ]]; then
+    transport="stdio"
+  else
+    case "$DAEMON_STATE" in
+      running|unmanaged-running)
+        socket_path="$(daemon_json_field "$DAEMON_LAST_JSON" socketPath)"
+        [[ -n "$socket_path" ]] || {
+          warn "running app-server did not report a control socket"
+          return 1
+        }
+        transport="uds"
+        ;;
+      stopped|unsupported)
+        transport="stdio"
+        ;;
+      stale|unknown)
+        warn "Codex app-server daemon state is $DAEMON_STATE; session cleanup is unsafe."
+        warn "run 'codex-tool daemon repair' first."
+        return 1
+        ;;
+      *)
+        warn "unsupported daemon state: $DAEMON_STATE"
+        return 1
+        ;;
+    esac
+  fi
+
+  binary="$(session_admin_binary 2>/dev/null || true)"
+  [[ -n "$binary" ]] || {
+    warn "no Codex binary is available for app-server session management"
+    return 1
+  }
+
+  script="$(write_session_admin_script)"
+  local -a args=(
+    "$script"
+    --codex "$binary"
+    --transport "$transport"
+    --mode "$mode"
+  )
+  [[ "$all_threads" == "1" ]] && args+=( --all )
+  [[ -z "$ids_file" ]] || args+=( --ids-file "$ids_file" )
+  [[ "$transport" != "uds" ]] || args+=( --socket "$socket_path" )
+
+  # The Python process and every Codex child it starts must not inherit FD 9.
+  python3 "${args[@]}" 9>&-
+}
+
+foreground_codex_pids() {
+  local proc pid uid exe cmd
+  for proc in /proc/[0-9]*; do
+    [[ -r "$proc/status" && -r "$proc/cmdline" ]] || continue
+    pid="${proc##*/}"
+    uid="$(awk '/^Uid:/{print $2; exit}' "$proc/status" 2>/dev/null || true)"
+    [[ "$uid" == "$UID" ]] || continue
+    exe="$(readlink "$proc/exe" 2>/dev/null || true)"
+    exe="${exe% (deleted)}"
+    case "$exe" in
+      "$VERSIONS_DIR/"*|"$CODEX_DATA_DIR/packages/"*) ;;
+      *) continue ;;
+    esac
+    cmd="$(tr '\0' ' ' < "$proc/cmdline" 2>/dev/null || true)"
+    [[ "$cmd" == *"app-server"* ]] && continue
+    printf '%s %s\n' "$pid" "$cmd"
+  done
+}
+
+daemon_stop_for_prune() {
+  daemon_snapshot
+  case "$DAEMON_STATE" in
+    running)
+      make_work_dir
+      local out="$WORK_DIR/prune-daemon-stop.$$.json"
+      local err="$WORK_DIR/prune-daemon-stop.$$.stderr"
+      log "stopping managed Codex app-server daemon"
+      if ! daemon_lifecycle "$DAEMON_BIN" stop "$out" "$err"; then
+        [[ ! -s "$err" ]] || warn "daemon stop: $(tr '\n' ' ' < "$err" | sed 's/[[:space:]]\+/ /g' | cut -c1-500)"
+        return 1
+      fi
+      ;;
+    stopped|unsupported)
+      ;;
+    unmanaged-running)
+      warn "an unmanaged Codex app-server is running; prune will not terminate it automatically."
+      warn "stop it manually and rerun prune."
+      return 1
+      ;;
+    stale|unknown)
+      warn "daemon state is $DAEMON_STATE; attempting conservative managed-process cleanup for prune."
+      ;;
+  esac
+
+  daemon_terminate_managed_processes || return 1
+  daemon_cleanup_transient_state || return 1
+  return 0
 }
 
 clean_data() {
-  local yes="$1"
-  confirm_or_die "$yes" "Delete known Codex history/log data (sessions, archived_sessions, history.jsonl, log) while preserving config, auth, packages, daemon state, and unknown entries?"
-  [[ -d "$CODEX_DATA_DIR" ]] || { log "Codex data directory does not exist; nothing to clean"; return; }
+  local yes="$1" all_threads="$2" dry_run="$3"
 
-  daemon_stop_for_mutation || return 1
-  local rc=0
-  clean_known_user_data || rc=1
+  log "scanning persisted Codex sessions through app-server"
+  session_admin_run scan-clean "$all_threads" "" auto || return 1
+  (( dry_run )) && {
+    log "dry run only; no session data was modified"
+    return 0
+  }
 
-  if ! daemon_restore_after_mutation; then
-    rc=1
+  if (( all_threads )); then
+    confirm_or_die "$yes" "Delete all persisted Codex sessions? Active/background threads will be interrupted first."
+  else
+    confirm_or_die "$yes" "Delete inactive persisted Codex sessions? Active/background threads will be preserved."
   fi
 
-  if (( rc == 0 )); then
-    log "cleaned known Codex history/log data; configuration, authentication, packages, daemon state, and unknown entries were preserved"
-  fi
-  return "$rc"
+  session_admin_run clean "$all_threads" "" auto
 }
 
 prune_all() {
-  local yes="$1" force="$2"
-  # Validate the public command path before stopping anything or deleting data.
+  local yes="$1" force="$2" dry_run="$3"
+
   if [[ -e "$CODEX_COMMAND" && ! -L "$CODEX_COMMAND" ]]; then
     if [[ -f "$CODEX_COMMAND" ]]; then
       (( force )) || die "$CODEX_COMMAND is a regular file, not a symlink; use 'prune --force' only if it should be removed"
@@ -1245,29 +1758,61 @@ prune_all() {
       die "$CODEX_COMMAND is not a symlink or regular file; refusing to remove it"
     fi
   fi
-  confirm_or_die "$yes" "Stop any managed Codex daemon and remove all codex-tool managed versions, download cache, current link, and $CODEX_COMMAND?"
 
-  daemon_stop_for_mutation || return 1
+  local foreground
+  foreground="$(foreground_codex_pids)"
+  if [[ -n "$foreground" ]]; then
+    warn "foreground Codex process(es) are still using managed program files:"
+    printf '%s\n' "$foreground" >&2
+    die "close those Codex sessions before prune"
+  fi
 
-  local active_pids="" v pids
-  while IFS= read -r v; do
-    [[ -n "$v" ]] || continue
-    pids="$(version_running_pids "$v")"
-    if [[ -n "$pids" ]]; then
-      active_pids+="version $v: $(tr '\n' ' ' <<<"$pids" | sed 's/[[:space:]]\+/ /g')"
-      active_pids+=$'\n'
+  log "scanning loaded/background Codex threads"
+  session_admin_run scan-prune 0 "" auto || return 1
+
+  if (( dry_run )); then
+    printf 'Program/runtime assets that would be removed:\n'
+    printf '  %s\n' "$VERSIONS_DIR" "$CURRENT_LINK" "$DOWNLOADS_DIR" "$CODEX_COMMAND"
+    printf '  %s\n' "$CODEX_DATA_DIR/packages/app-server-daemon" "$CODEX_DATA_DIR/packages/standalone"
+    printf '  %s\n' "$CODEX_DATA_DIR/app-server-daemon" "$CODEX_DATA_DIR/app-server-control"
+    log "dry run only; no threads, daemon state, or program files were modified"
+    return 0
+  fi
+
+  confirm_or_die "$yes" "Delete all loaded/background Codex threads, stop the daemon, and remove Codex program/runtime assets? Inactive saved history and user config/auth will be preserved."
+
+  make_work_dir
+  local ids_file="$WORK_DIR/prune-background-threads.txt"
+  : > "$ids_file"
+
+  session_admin_run prepare-prune 0 "$ids_file" auto || return 1
+
+  daemon_snapshot
+  local daemon_was_running=0
+  [[ "$DAEMON_STATE" == "running" ]] && daemon_was_running=1
+
+  if ! daemon_stop_for_prune; then
+    warn "unable to stop Codex background runtime safely; prune aborted before program removal"
+    return 1
+  fi
+
+  if ! session_admin_run delete-ids 0 "$ids_file" stdio; then
+    warn "background thread interruption succeeded, but persistent thread deletion was incomplete."
+    if (( daemon_was_running )); then
+      daemon_snapshot
+      DAEMON_WAS_RUNNING=1
+      daemon_restore_after_mutation || true
     fi
-  done < <(
-    find "$VERSIONS_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null \
-      | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
-      | sort -Vr || true
-  )
+    return 1
+  fi
 
-  if [[ -n "$active_pids" ]]; then
-    warn "refusing to prune Codex versions still used by running process(es):"
-    printf '%s' "$active_pids" >&2
-    if (( DAEMON_WAS_RUNNING )); then
-      warn "the managed daemon was stopped for safety and will now be restored because prune was aborted."
+  foreground="$(foreground_codex_pids)"
+  if [[ -n "$foreground" ]]; then
+    warn "Codex process(es) appeared while prune was running:"
+    printf '%s\n' "$foreground" >&2
+    if (( daemon_was_running )); then
+      daemon_snapshot
+      DAEMON_WAS_RUNNING=1
       daemon_restore_after_mutation || true
     fi
     return 1
@@ -1279,12 +1824,15 @@ prune_all() {
   rm -f -- "$CURRENT_LINK"
   rm -rf -- "$VERSIONS_DIR" "$DOWNLOADS_DIR"
   mkdir -p -- "$VERSIONS_DIR" "$DOWNLOADS_DIR"
-  log "pruned all codex-tool managed Codex versions and download cache"
-  if (( DAEMON_WAS_RUNNING )); then
-    log "managed app-server daemon was stopped and intentionally left stopped; CODEX_HOME daemon packages/state were preserved"
-  else
-    log "codex-tool and all CODEX_HOME data, including daemon packages/state, were preserved"
-  fi
+
+  rm -rf -- \
+    "$CODEX_DATA_DIR/packages/app-server-daemon" \
+    "$CODEX_DATA_DIR/packages/standalone" \
+    "$CODEX_DATA_DIR/app-server-daemon" \
+    "$CODEX_DATA_DIR/app-server-control"
+
+  log "pruned Codex program/runtime assets and all loaded/background thread records"
+  log "inactive saved session history, configuration, authentication, skills, rules, and other user state were preserved"
 }
 
 daemon_protected_socket_path() {

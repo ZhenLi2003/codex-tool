@@ -2,6 +2,21 @@
 
 This file summarizes the major iterations of `codex-tool`.
 
+## 1.7.0
+
+- Reworked Codex mutations around the modern managed app-server daemon lifecycle.
+- Replaced `clean`'s destructive whole-`CODEX_HOME` wipe with a strict delete allowlist for sessions/history/log data.
+- Preserved Codex configuration, authentication, daemon state, managed packages, and unknown future `CODEX_HOME` entries during `clean`.
+- Added daemon stop/restore transactions to `install`, `update`, and `switch`.
+- Delayed daemon interruption until after downloads, checksums, archive validation, and isolated binary verification complete.
+- Added fail-closed behavior for stale/unknown daemon state and unmanaged app-server processes.
+- Changed `prune` to stop a healthy managed daemon before deleting codex-tool-managed CLI versions while preserving all daemon packages/state and leaving the daemon stopped.
+- Added running-process protection for explicit delete, history pruning, same-version replacement, and full prune.
+- Added `codex-tool daemon status`.
+- Added `codex-tool daemon repair [--yes]` for conservative stale managed-daemon recovery while preserving settings, logs, recovery metadata, and daemon packages.
+- If daemon restoration after version activation fails, the new CLI remains active and old versions are retained for recovery.
+
+
 ## 1.6.0
 
 - Added authenticated GitHub API fallback for networks where anonymous proxy egress is rate-limited and direct GitHub access is unavailable.

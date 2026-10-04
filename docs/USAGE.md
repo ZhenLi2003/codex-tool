@@ -1,11 +1,12 @@
-# codex-tool 1.6.0 — Usage Guide
+# codex-tool 1.7.0 — Usage Guide
 
 A lightweight version manager for the OpenAI Codex CLI standalone Linux x86_64 package.
 
 ## Key behavior
 
 - Installs the complete `codex-package-x86_64-unknown-linux-musl.tar.gz`, including modern runtime companions such as `codex-code-mode-host`.
-- Keeps Codex versions under `~/scripts/codex-tool/versions/` and user data under `~/.codex` untouched during install/update/switch.
+- Keeps Codex versions under `~/scripts/codex-tool/versions/` and treats modern app-server daemon state under `CODEX_HOME` as lifecycle-managed state rather than disposable cache.
+- `install`, `update`, and `switch` stop/restore a healthy managed daemon only around the activation transaction.
 - `list` is local-only and never queries GitHub.
 - Large release downloads use persistent `.part` files, unlimited total transfer time by default, retry/resume, and SHA-256 verification.
 - Small checksum downloads use script-level retries and do not require curl `--retry-all-errors`, improving compatibility with curl versions older than 7.71.0.
@@ -29,6 +30,8 @@ codex-tool update
 codex-tool delete X.Y.Z
 codex-tool clean [--yes]
 codex-tool prune [--yes] [--force]
+codex-tool daemon status
+codex-tool daemon repair [--yes]
 codex-tool list
 codex-tool switch X.Y.Z
 codex-tool auth login
@@ -37,7 +40,7 @@ codex-tool auth logout
 codex-tool version
 ```
 
-`prune` removes all managed Codex versions, the `current` link, download cache, and `~/.local/bin/codex`. It keeps `codex-tool` and `~/.codex`.
+`prune` first stops a healthy managed daemon when necessary, then removes codex-tool-managed versions, the `current` link, download cache, and `~/.local/bin/codex`. It intentionally leaves the daemon stopped and preserves `codex-tool`, all `CODEX_HOME` data, daemon settings, and daemon packages.
 
 ## GitHub API rate-limit fallback
 
@@ -98,3 +101,65 @@ To inspect the installed curl version:
 ```bash
 curl --version
 ```
+
+
+## Daemon-aware lifecycle
+
+Codex app-server daemon state is not treated as disposable user cache.
+
+### Version activation
+
+For `install`, `update`, and `switch`:
+
+1. download, checksum verification, archive validation, and isolated binary validation happen while the existing daemon keeps running;
+2. immediately before changing the active CLI or replacing an installed version, codex-tool snapshots daemon state;
+3. a healthy managed daemon is stopped through `codex app-server daemon stop`;
+4. the version selection is changed atomically;
+5. if the daemon was previously running, codex-tool starts it again through the official lifecycle command;
+6. history pruning runs only after daemon restoration succeeds.
+
+If restoration fails, the selected CLI remains active, the command returns failure, and older versions are retained.
+
+An unmanaged app-server is never terminated automatically. Stale or unknown daemon state causes mutation commands to fail closed and direct the user to `codex-tool daemon repair`.
+
+### clean
+
+`clean` no longer wipes the top level of `CODEX_HOME`. It removes only this allowlist:
+
+```text
+sessions/
+archived_sessions/
+history.jsonl
+log/
+```
+
+It preserves configuration, authentication, daemon state, `packages/`, and all unknown entries. If a healthy managed daemon is running, it is stopped before the cleanup and restored afterward.
+
+### daemon status
+
+```bash
+codex-tool daemon status
+```
+
+Reports lifecycle support, classified daemon state, control binary/backend, managed/running versions and socket path when available, plus managed process IDs for diagnostic use.
+
+### daemon repair
+
+```bash
+codex-tool daemon repair
+```
+
+This is the explicit stale-state recovery path. It first tries the official daemon stop command. If that fails, it identifies only user-owned Codex app-server processes, terminates them, validates the protected `/tmp/codex-daemon-UID` directory before touching it, and removes transient PID/socket/lock state. It preserves:
+
+```text
+CODEX_HOME/app-server-daemon/settings.json
+CODEX_HOME/app-server-daemon/loaded-threads.json
+CODEX_HOME/app-server-daemon/*.log
+CODEX_HOME/packages/
+```
+
+If stale state indicates a daemon had been active, repair attempts to start it again.
+
+### Running-process protection
+
+A version directory is not removed while a user-owned process still executes a binary from it. This protection applies to explicit `delete`, automatic history pruning, same-version repair/replacement, and full `prune`.

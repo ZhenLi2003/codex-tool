@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 022
 
-TOOL_VERSION="1.9.0"
+TOOL_VERSION="1.9.1"
 TOOL_HOME="${CODEX_TOOL_HOME:-$HOME/scripts/codex-tool}"
 VERSIONS_DIR="$TOOL_HOME/versions"
 DOWNLOADS_DIR="$TOOL_HOME/downloads"
@@ -1652,7 +1652,7 @@ class Client:
             "clientInfo": {
                 "name": "codex-tool",
                 "title": "codex-tool session manager",
-                "version": "1.9.0",
+                "version": "1.9.1",
             },
             "capabilities": {"experimentalApi": True},
         }, timeout=15)
@@ -2023,7 +2023,7 @@ def main():
     parser.add_argument("--socket")
     parser.add_argument(
         "--mode",
-        choices=("scan-clean", "capture-active", "capture-loaded", "clean", "clean-stopped", "scan-prune", "prepare-prune", "delete-ids"),
+        choices=("probe-features", "scan-clean", "capture-active", "capture-loaded", "clean", "clean-stopped", "scan-prune", "prepare-prune", "delete-ids"),
         required=True,
     )
     parser.add_argument("--all", action="store_true")
@@ -2032,6 +2032,48 @@ def main():
 
     client = Client(args.codex, args.transport, args.socket)
     try:
+        if args.mode == "probe-features":
+            wanted = {
+                "api_key_model_discovery",
+                "code_mode_host",
+                "auth_elicitation",
+                "mcp_oauth_refresh_coordination",
+            }
+            cursor = None
+            seen_cursors = set()
+            selected = {}
+            for _ in range(10):
+                page = client.request(
+                    "experimentalFeature/list",
+                    {"cursor": cursor, "limit": 100, "threadId": None},
+                    timeout=5,
+                )
+                for feature in page.get("data") or []:
+                    name = feature.get("name")
+                    if name in wanted:
+                        selected[name] = bool(feature.get("enabled"))
+                cursor = page.get("nextCursor")
+                if not cursor:
+                    break
+                if cursor in seen_cursors:
+                    raise RuntimeError("experimentalFeature/list repeated a cursor")
+                seen_cursors.add(cursor)
+            else:
+                raise RuntimeError("experimentalFeature/list exceeded 10 pages")
+            missing = sorted(wanted - set(selected))
+            if missing:
+                raise RuntimeError(
+                    "experimentalFeature/list omitted required shared feature(s): "
+                    + ", ".join(missing)
+                )
+            if not args.ids_file:
+                raise RuntimeError("probe-features requires --ids-file")
+            with open(args.ids_file, "w", encoding="utf-8") as out:
+                json.dump(selected, out, sort_keys=True, separators=(",", ":"))
+                out.write("\n")
+            print("Shared daemon feature probe: ok")
+            return 0
+
         if args.mode == "capture-loaded":
             loaded = list_loaded_ids(client)
             write_ids(args.ids_file, loaded)
@@ -2187,6 +2229,7 @@ session_admin_run() {
   local all_threads="${2:-0}"
   local ids_file="${3:-}"
   local force_transport="${4:-auto}"
+  local binary_override="${5:-}"
 
   daemon_snapshot
   local transport socket_path binary script
@@ -2219,7 +2262,11 @@ session_admin_run() {
     esac
   fi
 
-  binary="$(session_admin_binary 2>/dev/null || true)"
+  if [[ -n "$binary_override" ]]; then
+    binary="$binary_override"
+  else
+    binary="$(session_admin_binary 2>/dev/null || true)"
+  fi
   [[ -n "$binary" ]] || {
     warn "no Codex binary is available for app-server session management"
     return 1
@@ -2238,6 +2285,105 @@ session_admin_run() {
 
   # The Python process and every Codex child it starts must not inherit FD 9.
   python3 "${args[@]}" 9>&-
+}
+
+current_cli_binary() {
+  local cv candidate
+  cv="$(current_version 2>/dev/null || true)"
+  if [[ -n "$cv" ]]; then
+    candidate="$(version_codex_path "$cv" 2>/dev/null || true)"
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  fi
+  [[ -x "$CODEX_COMMAND" ]] && { printf '%s\n' "$CODEX_COMMAND"; return 0; }
+  return 1
+}
+
+DAEMON_COMPAT_STATUS=""
+DAEMON_COMPAT_DETAIL=""
+
+daemon_compatibility_probe() {
+  DAEMON_COMPAT_STATUS="unknown"
+  DAEMON_COMPAT_DETAIL=""
+
+  daemon_snapshot
+  [[ "$DAEMON_STATE" == "running" ]] || {
+    DAEMON_COMPAT_STATUS="not-running"
+    DAEMON_COMPAT_DETAIL="managed app-server is not running"
+    return 2
+  }
+
+  local reference_binary
+  reference_binary="$(current_cli_binary 2>/dev/null || true)"
+  [[ -n "$reference_binary" ]] || {
+    DAEMON_COMPAT_STATUS="unavailable"
+    DAEMON_COMPAT_DETAIL="no active Codex CLI is available for compatibility comparison"
+    return 2
+  }
+
+  make_work_dir
+  local reference_json="$WORK_DIR/compat-reference.$$.json"
+  local daemon_json="$WORK_DIR/compat-daemon.$$.json"
+  local reference_out="$WORK_DIR/compat-reference.$$.out"
+  local reference_err="$WORK_DIR/compat-reference.$$.err"
+  local daemon_out="$WORK_DIR/compat-daemon.$$.out"
+  local daemon_err="$WORK_DIR/compat-daemon.$$.err"
+
+  if ! session_admin_run probe-features 0 "$reference_json" stdio "$reference_binary" >"$reference_out" 2>"$reference_err"; then
+    DAEMON_COMPAT_STATUS="unavailable"
+    DAEMON_COMPAT_DETAIL="current CLI could not provide experimentalFeature/list: $(tr '\n' ' ' < "$reference_err" | sed 's/[[:space:]]\+/ /g' | cut -c1-500)"
+    return 2
+  fi
+
+  if ! session_admin_run probe-features 0 "$daemon_json" auto "$reference_binary" >"$daemon_out" 2>"$daemon_err"; then
+    DAEMON_COMPAT_STATUS="broken"
+    DAEMON_COMPAT_DETAIL="shared daemon experimentalFeature/list failed: $(tr '\n' ' ' < "$daemon_err" | sed 's/[[:space:]]\+/ /g' | cut -c1-500)"
+    return 1
+  fi
+
+  if ! cmp -s -- "$reference_json" "$daemon_json"; then
+    DAEMON_COMPAT_STATUS="feature-mismatch"
+    DAEMON_COMPAT_DETAIL="$(python3 - "$reference_json" "$daemon_json" <<'PY' 2>/dev/null || true
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    expected=json.load(f)
+with open(sys.argv[2], encoding="utf-8") as f:
+    actual=json.load(f)
+parts=[]
+for name in sorted(set(expected) | set(actual)):
+    if expected.get(name) != actual.get(name):
+        parts.append(f"{name}: cli={expected.get(name)!s.lower()} daemon={actual.get(name)!s.lower()}")
+print("; ".join(parts))
+PY
+)"
+    [[ -n "$DAEMON_COMPAT_DETAIL" ]] || DAEMON_COMPAT_DETAIL="shared feature settings differ from the current CLI"
+    return 1
+  fi
+
+  DAEMON_COMPAT_STATUS="healthy"
+  DAEMON_COMPAT_DETAIL="experimentalFeature/list and shared feature settings match the current CLI"
+  return 0
+}
+
+daemon_update_from_current_cli() {
+  local binary package_root
+  binary="$(current_cli_binary 2>/dev/null || true)"
+  [[ -n "$binary" ]] || return 1
+  package_root="$(cd "$(dirname "$binary")/.." 2>/dev/null && pwd -P || true)"
+  [[ -n "$package_root" ]] || return 1
+  is_complete_package_dir "$package_root" || return 1
+
+  make_work_dir
+  local out="$WORK_DIR/daemon-update-from-cli.$$.json"
+  local err="$WORK_DIR/daemon-update-from-cli.$$.stderr"
+  log "realigning managed app-server package with the active Codex CLI"
+  if ! "$binary" app-server daemon update --from-cli --yes >"$out" 2>"$err" 9>&-; then
+    [[ ! -s "$err" ]] || warn "daemon update --from-cli: $(tr '\n' ' ' < "$err" | sed 's/[[:space:]]\+/ /g' | cut -c1-500)"
+    return 1
+  fi
+  return 0
 }
 
 foreground_codex_pids() {

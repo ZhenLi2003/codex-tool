@@ -1545,7 +1545,7 @@ class Client:
             "clientInfo": {
                 "name": "codex-tool",
                 "title": "codex-tool session manager",
-                "version": "1.8.1",
+                "version": "1.9.0",
             },
             "capabilities": {"experimentalApi": True},
         }, timeout=15)

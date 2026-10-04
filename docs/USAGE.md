@@ -1,4 +1,4 @@
-# codex-tool 1.7.0 — Usage Guide
+# codex-tool 1.7.1 — Usage Guide
 
 A lightweight version manager for the OpenAI Codex CLI standalone Linux x86_64 package.
 
@@ -7,6 +7,7 @@ A lightweight version manager for the OpenAI Codex CLI standalone Linux x86_64 p
 - Installs the complete `codex-package-x86_64-unknown-linux-musl.tar.gz`, including modern runtime companions such as `codex-code-mode-host`.
 - Keeps Codex versions under `~/scripts/codex-tool/versions/` and treats modern app-server daemon state under `CODEX_HOME` as lifecycle-managed state rather than disposable cache.
 - `install`, `update`, and `switch` stop/restore a healthy managed daemon only around the activation transaction.
+- Read-only commands do not acquire the exclusive manager lock; mutation commands use a bounded host-local runtime lock.
 - `list` is local-only and never queries GitHub.
 - Large release downloads use persistent `.part` files, unlimited total transfer time by default, retry/resume, and SHA-256 verification.
 - Small checksum downloads use script-level retries and do not require curl `--retry-all-errors`, improving compatibility with curl versions older than 7.71.0.
@@ -163,3 +164,42 @@ If stale state indicates a daemon had been active, repair attempts to start it a
 ### Running-process protection
 
 A version directory is not removed while a user-owned process still executes a binary from it. This protection applies to explicit `delete`, automatic history pruning, same-version repair/replacement, and full `prune`.
+
+
+## Manager locking in 1.7.1
+
+The manager lock is no longer taken before command dispatch.
+
+Read-only commands:
+
+```text
+version
+help
+list
+auth status
+daemon status
+```
+
+run without the exclusive manager lock. In particular, `version` and `help` also avoid unrelated dependency checks such as curl/tar/sha256sum.
+
+Mutation commands obtain an exclusive lock in a host-local runtime directory:
+
+```text
+$XDG_RUNTIME_DIR/codex-tool
+```
+
+when a user-owned runtime directory is available, otherwise:
+
+```text
+/tmp/codex-tool-$UID
+```
+
+The directory is validated as a real, user-owned directory and forced to mode `0700`.
+
+Default lock wait:
+
+```text
+CODEX_TOOL_LOCK_TIMEOUT=10
+```
+
+If the lock cannot be acquired within that interval, codex-tool exits with a diagnostic instead of blocking indefinitely. When a valid holder PID file is available, the error includes the holder PID and command line.

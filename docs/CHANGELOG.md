@@ -15,6 +15,9 @@ This file summarizes the major iterations of `codex-tool`.
 - Installer migration logic automatically detects and releases manager locks inherited by old managed daemons before overwriting codex-tool.
 - Fixed installer Bash variable expansion introduced while adding legacy-lock recovery.
 - Retained FD 9 isolation for every Codex daemon/session-management child process.
+- Aligned `codex-tool stop` with official Codex semantics: normal stop ends app-server while preserving the independent updater loop.
+- If an older updater still holds `manager.lock`, only the verified holder PID is terminated to release the legacy flock.
+- Added EXIT-time daemon restoration when legacy-lock recovery stopped app-server but the subsequent mutation fails before its normal restore phase.
 
 ## 1.8.1
 

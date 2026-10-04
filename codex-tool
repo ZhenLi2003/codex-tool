@@ -1111,14 +1111,30 @@ daemon_restore_after_mutation() {
     return 1
   fi
 
-  local status
+  local status compat_rc=0
   status="$(daemon_json_field "$out" status)"
   case "$status" in
     started|alreadyRunning|running|restarted)
-      log "managed Codex app-server daemon restored"
       PRELOCK_DAEMON_WAS_RUNNING=0
       RESTORE_DAEMON_ON_EXIT=0
-      return 0
+
+      daemon_compatibility_probe || compat_rc=$?
+      case "$compat_rc" in
+        0)
+          log "managed Codex app-server daemon restored and compatibility-verified"
+          return 0
+          ;;
+        1)
+          warn "managed app-server started, but shared-daemon compatibility verification failed."
+          warn "compatibility: $DAEMON_COMPAT_DETAIL"
+          warn "run 'codex-tool daemon repair' before using Codex with the shared background server."
+          return 1
+          ;;
+        *)
+          warn "managed app-server started; compatibility verification was unavailable: $DAEMON_COMPAT_DETAIL"
+          return 0
+          ;;
+      esac
       ;;
     *)
       warn "daemon start returned unexpected status: ${status:-unknown}"
@@ -2777,40 +2793,73 @@ daemon_status() {
     [[ -z "$socket_path" ]] || printf 'Control socket: %s\n' "$socket_path"
   fi
 
-  local pids
+  local pids compat_rc=0
   pids="$(daemon_managed_pids)"
   [[ -z "$pids" ]] || printf 'Managed PIDs:   %s\n' "$(tr '\n' ' ' <<<"$pids" | sed 's/[[:space:]]\+/ /g')"
   if [[ "$DAEMON_STATE" == "stale" || "$DAEMON_STATE" == "unknown" ]]; then
     [[ ! -s "$DAEMON_LAST_ERR" ]] || printf 'Last error:     %s\n' "$(tr '\n' ' ' < "$DAEMON_LAST_ERR" | sed 's/[[:space:]]\+/ /g' | cut -c1-500)"
   fi
+
+  if [[ "$DAEMON_STATE" == "running" ]]; then
+    daemon_compatibility_probe || compat_rc=$?
+    printf 'Compatibility:  %s\n' "$DAEMON_COMPAT_STATUS"
+    [[ -z "$DAEMON_COMPAT_DETAIL" ]] || printf 'Compat detail:  %s\n' "$DAEMON_COMPAT_DETAIL"
+    (( compat_rc == 1 )) && return 1
+  fi
+
+  return 0
 }
 
 daemon_repair() {
   local yes="$1"
   daemon_snapshot
+
+  local should_restart=0
+  local compatibility_failure=0
+  local compat_rc=0
+
   case "$DAEMON_STATE" in
     running)
-      log "managed Codex app-server daemon is healthy; no repair is required"
-      return 0
+      daemon_compatibility_probe || compat_rc=$?
+      case "$compat_rc" in
+        0)
+          log "managed Codex app-server daemon is running and compatibility-verified; no repair is required"
+          return 0
+          ;;
+        1)
+          compatibility_failure=1
+          should_restart=1
+          warn "managed app-server is running but is not compatible with the current Codex CLI."
+          warn "compatibility: $DAEMON_COMPAT_DETAIL"
+          ;;
+        *)
+          warn "managed app-server lifecycle is healthy, but compatibility could not be verified: $DAEMON_COMPAT_DETAIL"
+          return 0
+          ;;
+      esac
       ;;
     unmanaged-running)
       die "an unmanaged app-server is running; codex-tool will not terminate or repair it"
       ;;
     stopped)
-      log "managed Codex app-server daemon is stopped and reports healthy lifecycle state; no repair is required"
+      log "managed Codex app-server daemon is stopped; no running shared server requires repair"
       return 0
       ;;
     unsupported)
       die "no daemon-capable Codex CLI is available"
       ;;
+    stale|unknown)
+      if daemon_has_processes || daemon_pid_records_present || \
+         [[ -e "$CODEX_DATA_DIR/app-server-control/app-server-control.sock" || -L "$CODEX_DATA_DIR/app-server-control/app-server-control.sock" ]]; then
+        should_restart=1
+      fi
+      ;;
   esac
 
-  confirm_or_die "$yes" "Repair stale Codex app-server daemon state? This may terminate stale managed app-server processes."
-
-  local should_restart=0
-  if daemon_has_processes || daemon_pid_records_present || \
-     [[ -e "$CODEX_DATA_DIR/app-server-control/app-server-control.sock" || -L "$CODEX_DATA_DIR/app-server-control/app-server-control.sock" ]]; then
-    should_restart=1
+  if (( compatibility_failure )); then
+    confirm_or_die "$yes" "Restart the incompatible managed Codex app-server and verify shared-daemon protocol compatibility?"
+  else
+    confirm_or_die "$yes" "Repair stale Codex app-server daemon state? This may terminate stale managed app-server processes."
   fi
 
   local binary
@@ -2818,39 +2867,89 @@ daemon_repair() {
   [[ -n "$binary" ]] || die "no daemon-capable Codex binary is available for repair"
 
   make_work_dir
-  local out="$WORK_DIR/daemon-repair-stop.$$.json" err="$WORK_DIR/daemon-repair-stop.$$.stderr"
-  if daemon_lifecycle "$binary" stop "$out" "$err"; then
-    log "official daemon stop completed during repair"
-  else
-    warn "official daemon stop failed; continuing with conservative stale-process recovery"
-    [[ ! -s "$err" ]] || warn "daemon stop: $(tr '\n' ' ' < "$err" | sed 's/[[:space:]]\+/ /g' | cut -c1-500)"
+  local out="$WORK_DIR/daemon-repair-stop.$$.json"
+  local err="$WORK_DIR/daemon-repair-stop.$$.stderr"
+
+  # Establish a fresh launch boundary. Official daemon start with no feature
+  # overrides clears stale launch-time feature overrides on a fresh process.
+  if ! stop_app_server_internal "daemon repair"; then
+    warn "official app-server stop did not fully recover the runtime; continuing with verified full-runtime cleanup"
   fi
+  daemon_terminate_managed_processes || die "unable to terminate managed Codex runtime processes during repair"
+  daemon_cleanup_transient_state || die "unable to clean daemon runtime state safely"
 
-  daemon_terminate_managed_processes || die "unable to terminate stale managed app-server processes"
-  daemon_cleanup_transient_state || die "unable to clean stale daemon runtime state safely"
+  (( should_restart )) || {
+    log "stale daemon runtime state cleaned; daemon remains stopped"
+    return 0
+  }
 
-  if (( should_restart )); then
-    binary="$(daemon_find_control_binary 2>/dev/null || true)"
-    [[ -n "$binary" ]] || die "transient daemon state was cleaned, but no daemon-capable binary is available to restart it"
-    out="$WORK_DIR/daemon-repair-start.$$.json"
-    err="$WORK_DIR/daemon-repair-start.$$.stderr"
-    if ! daemon_lifecycle "$binary" start "$out" "$err"; then
-      [[ ! -s "$err" ]] || warn "daemon start: $(tr '\n' ' ' < "$err" | sed 's/[[:space:]]\+/ /g' | cut -c1-500)"
-      die "daemon runtime state was cleaned but app-server could not be restarted"
-    fi
+  binary="$(daemon_find_control_binary 2>/dev/null || true)"
+  [[ -n "$binary" ]] || die "daemon runtime was cleaned, but no daemon-capable binary is available to restart it"
+
+  out="$WORK_DIR/daemon-repair-start.$$.json"
+  err="$WORK_DIR/daemon-repair-start.$$.stderr"
+  local start_ok=0
+  if daemon_lifecycle "$binary" start "$out" "$err"; then
     local status
     status="$(daemon_json_field "$out" status)"
     case "$status" in
-      started|alreadyRunning|running|restarted)
-        log "managed Codex app-server daemon repaired and running"
-        ;;
-      *)
-        die "daemon restart after repair returned unexpected status: ${status:-unknown}"
-        ;;
+      started|alreadyRunning|running|restarted) start_ok=1 ;;
+      *) warn "fresh daemon start returned unexpected status: ${status:-unknown}" ;;
     esac
   else
-    log "stale daemon runtime state cleaned; daemon remains stopped"
+    [[ ! -s "$err" ]] || warn "daemon start: $(tr '\n' ' ' < "$err" | sed 's/[[:space:]]\+/ /g' | cut -c1-500)"
   fi
+
+  if (( start_ok )); then
+    compat_rc=0
+    daemon_compatibility_probe || compat_rc=$?
+    if (( compat_rc == 0 )); then
+      log "managed Codex app-server daemon repaired, running, and compatibility-verified"
+      return 0
+    fi
+    if (( compat_rc == 2 )); then
+      warn "daemon restarted, but compatibility verification is unavailable: $DAEMON_COMPAT_DETAIL"
+      return 0
+    fi
+    warn "fresh daemon restart still failed compatibility verification."
+    warn "compatibility: $DAEMON_COMPAT_DETAIL"
+  else
+    warn "fresh daemon restart failed; attempting package-level repair from the active CLI"
+  fi
+
+  # A same-version managed package can still be stale or protocol-incompatible.
+  # As a second-stage repair, replace it from the complete active CLI package.
+  stop_app_server_internal "package compatibility repair" || true
+  daemon_terminate_managed_processes || die "unable to stop managed runtime before package repair"
+  daemon_cleanup_transient_state || die "unable to clean runtime before package repair"
+
+  daemon_update_from_current_cli \
+    || die "unable to realign the managed daemon package from the active Codex CLI"
+
+  binary="$(daemon_find_control_binary 2>/dev/null || true)"
+  [[ -n "$binary" ]] || die "daemon package was realigned, but no daemon-capable binary is available"
+
+  out="$WORK_DIR/daemon-repair-realigned-start.$$.json"
+  err="$WORK_DIR/daemon-repair-realigned-start.$$.stderr"
+  if ! daemon_lifecycle "$binary" start "$out" "$err"; then
+    [[ ! -s "$err" ]] || warn "daemon start after package repair: $(tr '\n' ' ' < "$err" | sed 's/[[:space:]]\+/ /g' | cut -c1-500)"
+    die "managed daemon package was realigned but app-server could not be started"
+  fi
+
+  compat_rc=0
+  daemon_compatibility_probe || compat_rc=$?
+  case "$compat_rc" in
+    0)
+      log "managed Codex app-server daemon package repaired and compatibility-verified"
+      ;;
+    1)
+      warn "daemon package was realigned, but shared-daemon compatibility is still broken."
+      die "compatibility: $DAEMON_COMPAT_DETAIL"
+      ;;
+    *)
+      warn "daemon package was realigned and started, but compatibility verification is unavailable: $DAEMON_COMPAT_DETAIL"
+      ;;
+  esac
 }
 
 auth_login() {

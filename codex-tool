@@ -2842,8 +2842,13 @@ daemon_repair() {
       die "an unmanaged app-server is running; codex-tool will not terminate or repair it"
       ;;
     stopped)
-      log "managed Codex app-server daemon is stopped; no running shared server requires repair"
-      return 0
+      if (( PRELOCK_DAEMON_WAS_RUNNING )); then
+        should_restart=1
+        warn "legacy manager-lock recovery stopped a previously running app-server; repair will restart and compatibility-check it"
+      else
+        log "managed Codex app-server daemon is stopped; no running shared server requires repair"
+        return 0
+      fi
       ;;
     unsupported)
       die "no daemon-capable Codex CLI is available"
@@ -2904,10 +2909,14 @@ daemon_repair() {
     compat_rc=0
     daemon_compatibility_probe || compat_rc=$?
     if (( compat_rc == 0 )); then
+      PRELOCK_DAEMON_WAS_RUNNING=0
+      RESTORE_DAEMON_ON_EXIT=0
       log "managed Codex app-server daemon repaired, running, and compatibility-verified"
       return 0
     fi
     if (( compat_rc == 2 )); then
+      PRELOCK_DAEMON_WAS_RUNNING=0
+      RESTORE_DAEMON_ON_EXIT=0
       warn "daemon restarted, but compatibility verification is unavailable: $DAEMON_COMPAT_DETAIL"
       return 0
     fi
@@ -2940,6 +2949,8 @@ daemon_repair() {
   daemon_compatibility_probe || compat_rc=$?
   case "$compat_rc" in
     0)
+      PRELOCK_DAEMON_WAS_RUNNING=0
+      RESTORE_DAEMON_ON_EXIT=0
       log "managed Codex app-server daemon package repaired and compatibility-verified"
       ;;
     1)
@@ -2947,6 +2958,8 @@ daemon_repair() {
       die "compatibility: $DAEMON_COMPAT_DETAIL"
       ;;
     *)
+      PRELOCK_DAEMON_WAS_RUNNING=0
+      RESTORE_DAEMON_ON_EXIT=0
       warn "daemon package was realigned and started, but compatibility verification is unavailable: $DAEMON_COMPAT_DETAIL"
       ;;
   esac

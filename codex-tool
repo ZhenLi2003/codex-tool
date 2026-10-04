@@ -1762,12 +1762,55 @@ clean_data() {
   }
 
   if (( all_threads )); then
-    confirm_or_die "$yes" "Delete all persisted Codex sessions? Active/background threads will be interrupted first."
+    confirm_or_die "$yes" "Delete all persisted Codex sessions? Active/background threads will be interrupted; a managed daemon may be restarted if live state blocks deletion."
   else
     confirm_or_die "$yes" "Delete inactive persisted Codex sessions? Active/background threads will be preserved."
   fi
 
-  session_admin_run clean "$all_threads" "" auto
+  if (( ! all_threads )); then
+    session_admin_run clean 0 "" auto
+    return $?
+  fi
+
+  # First attempt is fully online: interrupt active turns and delete through the
+  # existing app-server without disturbing the daemon.
+  if session_admin_run clean 1 "" auto; then
+    return 0
+  fi
+
+  warn "online clean --all could not remove every thread; evaluating managed-daemon fallback."
+  daemon_snapshot
+  case "$DAEMON_STATE" in
+    running)
+      ;;
+    stopped|unsupported)
+      warn "retrying clean --all through an isolated stdio app-server."
+      session_admin_run clean 1 "" stdio
+      return $?
+      ;;
+    unmanaged-running)
+      warn "the remaining live threads belong to an unmanaged app-server; codex-tool will not stop it automatically."
+      return 1
+      ;;
+    stale|unknown)
+      warn "daemon state is $DAEMON_STATE; run 'codex-tool daemon repair' before retrying clean --all."
+      return 1
+      ;;
+  esac
+
+  log "stopping managed app-server to establish a final clean --all boundary"
+  if ! daemon_stop_for_mutation; then
+    return 1
+  fi
+
+  local rc=0
+  session_admin_run clean 1 "" stdio || rc=$?
+
+  if ! daemon_restore_after_mutation; then
+    warn "session cleanup completed or partially completed, but the managed daemon could not be restored."
+    rc=1
+  fi
+  return "$rc"
 }
 
 prune_all() {

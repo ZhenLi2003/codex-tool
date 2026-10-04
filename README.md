@@ -247,6 +247,8 @@ Lock acquisition is bounded by `CODEX_TOOL_LOCK_TIMEOUT` (default: 10 seconds). 
 
 In 1.9.0, every Codex subprocess that can start or communicate with a long-lived daemon explicitly closes the manager-lock file descriptor before exec. The codex-tool parent also explicitly unlocks/closes it on exit. `codex-tool stop` intentionally bypasses the manager lock so it can release a lock inherited by an old daemon, while refusing to stop app-server if the same lock is held by a real in-flight codex-tool mutation. Mutation commands also detect this legacy condition before locking, stop the managed daemon automatically, and then acquire the lock normally.
 
+Normal `stop` follows the official Codex lifecycle: it stops the managed app-server but leaves the independent updater loop alone. If an updater from an older codex-tool release still holds `manager.lock`, only that verified lock-holder process is terminated. `prune` and `daemon repair` are the operations that tear down the full managed runtime. If legacy-lock recovery had to stop app-server before a mutation and that mutation later fails, codex-tool restores the previously running daemon during exit cleanup.
+
 ## Documentation
 
 - [Full usage guide](docs/USAGE.md)

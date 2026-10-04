@@ -1,4 +1,4 @@
-# codex-tool 1.7.1 — Usage Guide
+# codex-tool 1.8.0 — Usage Guide
 
 A lightweight version manager for the OpenAI Codex CLI standalone Linux x86_64 package.
 
@@ -29,8 +29,8 @@ The installer overwrites the manager script but preserves `versions/`, `current`
 codex-tool install X.Y.Z
 codex-tool update
 codex-tool delete X.Y.Z
-codex-tool clean [--yes]
-codex-tool prune [--yes] [--force]
+codex-tool clean [--all] [--dry-run] [--yes]
+codex-tool prune [--dry-run] [--yes] [--force]
 codex-tool daemon status
 codex-tool daemon repair [--yes]
 codex-tool list
@@ -41,7 +41,7 @@ codex-tool auth logout
 codex-tool version
 ```
 
-`prune` first stops a healthy managed daemon when necessary, then removes codex-tool-managed versions, the `current` link, download cache, and `~/.local/bin/codex`. It intentionally leaves the daemon stopped and preserves `codex-tool`, all `CODEX_HOME` data, daemon settings, and daemon packages.
+`clean` manages persisted sessions through the Codex app-server protocol. `prune` is the program/runtime cleanup operation: it removes loaded/background thread records, stops the managed daemon, removes codex-tool-managed CLI assets plus Codex managed daemon/standalone runtime packages, and preserves inactive saved history and user configuration/authentication.
 
 ## GitHub API rate-limit fallback
 
@@ -123,18 +123,54 @@ If restoration fails, the selected CLI remains active, the command returns failu
 
 An unmanaged app-server is never terminated automatically. Stale or unknown daemon state causes mutation commands to fail closed and direct the user to `codex-tool daemon repair`.
 
-### clean
+### clean / prune in 1.8.0
 
-`clean` no longer wipes the top level of `CODEX_HOME`. It removes only this allowlist:
+`CODEX_HOME` is treated as Codex-owned state. codex-tool does not directly delete rollout/session directories or SQLite databases.
 
-```text
-sessions/
-archived_sessions/
-history.jsonl
-log/
+Session management is performed through app-server JSON-RPC using `thread/list`, `thread/read`, `thread/loaded/list`, `thread/turns/list`, `turn/interrupt`, and `thread/delete`.
+
+#### clean
+
+```bash
+codex-tool clean --dry-run
+codex-tool clean
+codex-tool clean --all
+codex-tool clean --all --yes
 ```
 
-It preserves configuration, authentication, daemon state, `packages/`, and all unknown entries. If a healthy managed daemon is running, it is stopped before the cleanup and restored afterward.
+Default behavior:
+
+- enumerate both active and archived persisted threads;
+- classify by current app-server thread status;
+- delete non-active persisted threads through `thread/delete`;
+- preserve active/background threads;
+- keep a healthy daemon running throughout the operation.
+
+With `--all`, active threads are interrupted first. codex-tool finds an in-progress turn through `thread/turns/list`, requests `turn/interrupt`, waits for the thread to leave `active`, then deletes the persisted thread.
+
+If an active thread cannot be interrupted safely, `clean --all` fails instead of stopping the whole daemon or deleting backing files underneath it.
+
+#### prune
+
+```bash
+codex-tool prune --dry-run
+codex-tool prune
+codex-tool prune --yes
+```
+
+Prune is intentionally broader:
+
+- refuse to continue while a foreground Codex process is executing from managed program files;
+- enumerate all threads currently loaded by app-server;
+- request interruption for active background turns;
+- stop the managed daemon through the official lifecycle API;
+- use a temporary stdio app-server to delete persisted records belonging to the previously loaded/background threads;
+- remove codex-tool-managed versions/current/download cache and the managed `codex` command;
+- remove `CODEX_HOME/packages/app-server-daemon`, `CODEX_HOME/packages/standalone`, `CODEX_HOME/app-server-daemon`, and `CODEX_HOME/app-server-control`.
+
+Prune preserves inactive saved thread history as well as user configuration, authentication, skills, rules, memories, and other Codex-owned user state.
+
+Transient/internal loaded workers that have no persisted thread record after daemon shutdown are treated as already gone rather than as deletion failures.
 
 ### daemon status
 
@@ -203,3 +239,12 @@ CODEX_TOOL_LOCK_TIMEOUT=10
 ```
 
 If the lock cannot be acquired within that interval, codex-tool exits with a diagnostic instead of blocking indefinitely. When a valid holder PID file is available, the error includes the holder PID and command line.
+
+
+## Lock and subprocess isolation in 1.8.0
+
+The 1.7.1 bounded runtime lock remains in place. 1.8.0 additionally prevents lock-file descriptor inheritance.
+
+Every Codex child invoked for daemon lifecycle or session administration closes manager FD 9 before exec. The temporary Python app-server client is also launched with FD 9 closed, and Python uses `close_fds=True` for Codex children. On codex-tool exit, the parent explicitly unlocks and closes FD 9.
+
+This prevents a detached app-server or updater from retaining the codex-tool `flock` after the original manager process exits.

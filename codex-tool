@@ -966,6 +966,12 @@ install_version() {
     warn "Codex $version installation is incomplete; reinstalling it."
   fi
 
+  if [[ -d "$VERSIONS_DIR/$version" ]]; then
+    local running_pids
+    running_pids="$(version_running_pids "$version")"
+    [[ -z "$running_pids" ]] || die "cannot replace Codex $version while running process(es) still use it: $(tr '\n' ' ' <<<"$running_pids" | sed 's/[[:space:]]\+/ /g')"
+  fi
+
   make_work_dir
   local release_json="$WORK_DIR/release.json"
   log "resolving GitHub release rust-v$version"
@@ -1178,6 +1184,692 @@ prune_all() {
   confirm_or_die "$yes" "Stop any managed Codex daemon and remove all codex-tool managed versions, download cache, current link, and $CODEX_COMMAND?"
 
   daemon_stop_for_mutation || return 1
+
+  local active_pids="" v pids
+  while IFS= read -r v; do
+    [[ -n "$v" ]] || continue
+    pids="$(version_running_pids "$v")"
+    [[ -z "$pids" ]] || active_pids+="version $v: $(tr '\n' ' ' <<<"$pids" | sed 's/[[:space:]]\+/ /g')"
+  rm -f -- "$CURRENT_LINK"
+  rm -rf -- "$VERSIONS_DIR" "$DOWNLOADS_DIR"
+  mkdir -p -- "$VERSIONS_DIR" "$DOWNLOADS_DIR"
+  log "pruned all codex-tool managed Codex versions and download cache"
+  if (( DAEMON_WAS_RUNNING )); then
+    log "managed app-server daemon was stopped and intentionally left stopped; CODEX_HOME daemon packages/state were preserved"
+  else
+    log "codex-tool and all CODEX_HOME data, including daemon packages/state, were preserved"
+  fi
+}
+
+daemon_protected_socket_path() {
+  local advertised="$CODEX_DATA_DIR/app-server-control/app-server-control.sock"
+  local parent
+  parent="$(dirname "$advertised")"
+  mkdir -p -- "$parent"
+  chmod 0700 -- "$parent" 2>/dev/null || true
+  python3 - "$parent" "$(basename "$advertised")" <<'PY'
+import hashlib, os, sys
+parent=os.path.realpath(sys.argv[1])
+path=os.path.join(parent, sys.argv[2])
+root=os.path.realpath("/tmp")
+print(os.path.join(root, f"codex-daemon-{os.geteuid()}", hashlib.sha256(os.fsencode(path)).hexdigest()))
+PY
+}
+
+unix_socket_connectable() {
+  local path="$1"
+  python3 - "$path" <<'PY' >/dev/null 2>&1
+import socket, sys
+s=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(0.25)
+try:
+    s.connect(sys.argv[1])
+except OSError:
+    raise SystemExit(1)
+else:
+    raise SystemExit(0)
+finally:
+    s.close()
+PY
+}
+
+daemon_terminate_managed_processes() {
+  local pids pid deadline remaining
+  pids="$(daemon_managed_pids)"
+  [[ -n "$pids" ]] || return 0
+
+  warn "terminating stale managed Codex app-server process(es): $(tr '\n' ' ' <<<"$pids" | sed 's/[[:space:]]\+/ /g')"
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    kill -TERM "$pid" 2>/dev/null || true
+  done <<<"$pids"
+
+  deadline=$((SECONDS + 5))
+  while (( SECONDS < deadline )); do
+    remaining="$(daemon_managed_pids)"
+    [[ -z "$remaining" ]] && return 0
+    sleep 1
+  done
+
+  remaining="$(daemon_managed_pids)"
+  if [[ -n "$remaining" ]]; then
+    warn "forcing termination of stale managed Codex app-server process(es): $(tr '\n' ' ' <<<"$remaining" | sed 's/[[:space:]]\+/ /g')"
+    while IFS= read -r pid; do
+      [[ -n "$pid" ]] || continue
+      kill -KILL "$pid" 2>/dev/null || true
+    done <<<"$remaining"
+    sleep 1
+  fi
+
+  remaining="$(daemon_managed_pids)"
+  [[ -z "$remaining" ]] || { warn "managed app-server processes are still running: $remaining"; return 1; }
+}
+
+daemon_cleanup_transient_state() {
+  local state="$CODEX_DATA_DIR/app-server-daemon"
+  local control="$CODEX_DATA_DIR/app-server-control"
+  local advertised="$control/app-server-control.sock"
+  local physical shared owner mode
+
+  physical="$(daemon_protected_socket_path)"
+  if [[ -e "$physical" || -S "$physical" || -L "$physical" ]]; then
+    if unix_socket_connectable "$physical"; then
+      warn "refusing to remove active physical daemon socket: $physical"
+      return 1
+    fi
+    shared="$(dirname "$physical")"
+    if [[ -d "$shared" ]]; then
+      owner="$(stat -c '%u' "$shared" 2>/dev/null || true)"
+      mode="$(stat -c '%a' "$shared" 2>/dev/null || true)"
+      [[ "$owner" == "$UID" && "$mode" == "700" ]] || {
+        warn "refusing to modify unsafe daemon socket directory: $shared (owner=$owner mode=$mode)"
+        return 1
+      }
+    fi
+    rm -f -- "$physical" "$physical.lock"
+  fi
+
+  if [[ -e "$advertised" || -S "$advertised" || -L "$advertised" ]]; then
+    if unix_socket_connectable "$advertised"; then
+      warn "refusing to remove active advertised daemon socket: $advertised"
+      return 1
+    fi
+    rm -f -- "$advertised"
+  fi
+  rm -f -- "$control/app-server-startup.lock"
+
+  local name
+  for name in app-server.pid app-server-updater.pid daemon.pid daemon-updater.pid; do
+    rm -f -- "$state/$name"
+  done
+
+  # Preserve settings.json, logs, loaded-threads.json and managed packages.
+  return 0
+}
+
+daemon_status() {
+  daemon_snapshot
+  printf 'Daemon support: %s\n' "$([[ "$DAEMON_SUPPORTED" == "1" ]] && printf yes || printf no)"
+  printf 'Daemon state:   %s\n' "$DAEMON_STATE"
+  [[ -z "$DAEMON_BIN" ]] || printf 'Control binary: %s\n' "$DAEMON_BIN"
+  [[ -z "$DAEMON_BACKEND" ]] || printf 'Backend:        %s\n' "$DAEMON_BACKEND"
+
+  if [[ -s "$DAEMON_LAST_JSON" ]]; then
+    local managed_path managed_version app_version socket_path
+    managed_path="$(daemon_json_field "$DAEMON_LAST_JSON" managedCodexPath)"
+    managed_version="$(daemon_json_field "$DAEMON_LAST_JSON" managedCodexVersion)"
+    app_version="$(daemon_json_field "$DAEMON_LAST_JSON" appServerVersion)"
+    socket_path="$(daemon_json_field "$DAEMON_LAST_JSON" socketPath)"
+    [[ -z "$managed_path" ]] || printf 'Managed binary: %s\n' "$managed_path"
+    [[ -z "$managed_version" ]] || printf 'Managed version:%s%s\n' " " "$managed_version"
+    [[ -z "$app_version" ]] || printf 'Running version:%s%s\n' " " "$app_version"
+    [[ -z "$socket_path" ]] || printf 'Control socket: %s\n' "$socket_path"
+  fi
+
+  local pids
+  pids="$(daemon_managed_pids)"
+  [[ -z "$pids" ]] || printf 'Managed PIDs:   %s\n' "$(tr '\n' ' ' <<<"$pids" | sed 's/[[:space:]]\+/ /g')"
+  if [[ "$DAEMON_STATE" == "stale" || "$DAEMON_STATE" == "unknown" ]]; then
+    [[ ! -s "$DAEMON_LAST_ERR" ]] || printf 'Last error:     %s\n' "$(tr '\n' ' ' < "$DAEMON_LAST_ERR" | sed 's/[[:space:]]\+/ /g' | cut -c1-500)"
+  fi
+}
+
+daemon_repair() {
+  local yes="$1"
+  daemon_snapshot
+  case "$DAEMON_STATE" in
+    running)
+      log "managed Codex app-server daemon is healthy; no repair is required"
+      return 0
+      ;;
+    unmanaged-running)
+      die "an unmanaged app-server is running; codex-tool will not terminate or repair it"
+      ;;
+    stopped)
+      log "managed Codex app-server daemon is stopped and reports healthy lifecycle state; no repair is required"
+      return 0
+      ;;
+    unsupported)
+      die "no daemon-capable Codex CLI is available"
+      ;;
+  esac
+
+  confirm_or_die "$yes" "Repair stale Codex app-server daemon state? This may terminate stale managed app-server processes."
+
+  local should_restart=0
+  if daemon_has_processes || daemon_pid_records_present || \
+     [[ -e "$CODEX_DATA_DIR/app-server-control/app-server-control.sock" || -L "$CODEX_DATA_DIR/app-server-control/app-server-control.sock" ]]; then
+    should_restart=1
+  fi
+
+  local binary
+  binary="$(daemon_find_control_binary 2>/dev/null || true)"
+  [[ -n "$binary" ]] || die "no daemon-capable Codex binary is available for repair"
+
+  make_work_dir
+  local out="$WORK_DIR/daemon-repair-stop.$$.json" err="$WORK_DIR/daemon-repair-stop.$$.stderr"
+  if daemon_lifecycle "$binary" stop "$out" "$err"; then
+    log "official daemon stop completed during repair"
+  else
+    warn "official daemon stop failed; continuing with conservative stale-process recovery"
+    [[ ! -s "$err" ]] || warn "daemon stop: $(tr '\n' ' ' < "$err" | sed 's/[[:space:]]\+/ /g' | cut -c1-500)"
+  fi
+
+  daemon_terminate_managed_processes || die "unable to terminate stale managed app-server processes"
+  daemon_cleanup_transient_state || die "unable to clean stale daemon runtime state safely"
+
+  if (( should_restart )); then
+    binary="$(daemon_find_control_binary 2>/dev/null || true)"
+    [[ -n "$binary" ]] || die "transient daemon state was cleaned, but no daemon-capable binary is available to restart it"
+    out="$WORK_DIR/daemon-repair-start.$$.json"
+    err="$WORK_DIR/daemon-repair-start.$$.stderr"
+    if ! daemon_lifecycle "$binary" start "$out" "$err"; then
+      [[ ! -s "$err" ]] || warn "daemon start: $(tr '\n' ' ' < "$err" | sed 's/[[:space:]]\+/ /g' | cut -c1-500)"
+      die "daemon runtime state was cleaned but app-server could not be restarted"
+    fi
+    local status
+    status="$(daemon_json_field "$out" status)"
+    case "$status" in
+      started|alreadyRunning|running|restarted)
+        log "managed Codex app-server daemon repaired and running"
+        ;;
+      *)
+        die "daemon restart after repair returned unexpected status: ${status:-unknown}"
+        ;;
+    esac
+  else
+    log "stale daemon runtime state cleaned; daemon remains stopped"
+  fi
+}
+
+auth_login() {
+  [[ -t 0 && -t 2 ]] || die "auth login requires an interactive terminal"
+  make_work_dir
+  local out="$WORK_DIR/auth-login.json"
+  print_github_token_help
+  printf '\nPaste GitHub token (input hidden): ' >&2
+  local token=""
+  IFS= read -r -s token
+  printf '\n' >&2
+  [[ -n "$token" ]] || die "empty token"
+  validate_github_token_text "$token" || die "token contains whitespace"
+
+  local body="$WORK_DIR/auth-login-body.json"
+  local headers="$WORK_DIR/auth-login.headers"
+  local err="$WORK_DIR/auth-login.stderr"
+  local result rc status msg
+  result="$(github_api_once "$API_BASE/releases/latest" "$body" "$headers" "$err" normal "$token")"
+  rc="$(sed -n '1p' <<<"$result")"
+  status="$(sed -n '2p' <<<"$result")"
+  if [[ "$rc" == "0" && "$status" =~ ^2[0-9][0-9]$ ]]; then
+    save_github_token "$token"
+    log "GitHub authentication verified against openai/codex release API"
+    return 0
+  fi
+  msg="$(github_error_message "$body")"
+  [[ -n "$msg" ]] && warn "GitHub: $msg"
+  [[ -s "$err" ]] && warn "curl: $(tr '\n' ' ' < "$err" | sed 's/[[:space:]]\+/ /g' | cut -c1-500)"
+  die "GitHub token verification failed (curl exit $rc, HTTP $status); token was not saved"
+}
+
+auth_status() {
+  printf 'GitHub auth source: %s' "$(github_token_source)"
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    printf ' (environment token takes precedence over saved token)\n'
+  else
+    printf '\n'
+  fi
+}
+
+auth_logout() {
+  if [[ -f "$GITHUB_TOKEN_FILE" || -L "$GITHUB_TOKEN_FILE" ]]; then
+    rm -f -- "$GITHUB_TOKEN_FILE"
+    log "removed saved GitHub token: $GITHUB_TOKEN_FILE"
+  else
+    log "no codex-tool saved GitHub token found"
+  fi
+  [[ -z "${GITHUB_TOKEN:-}" ]] || warn "GITHUB_TOKEN is still set in the current environment and will continue to take precedence."
+}
+
+main() {
+  ensure_supported_platform
+  need_cmd curl; need_cmd python3; need_cmd tar; need_cmd sha256sum; need_cmd find; need_cmd sort; need_cmd stat
+  init_curl_compat
+  validate_uint CODEX_TOOL_API_TIMEOUT "$API_TIMEOUT"
+  validate_uint CODEX_TOOL_CONNECT_TIMEOUT "$CONNECT_TIMEOUT"
+  validate_uint CODEX_TOOL_DOWNLOAD_RETRIES "$DOWNLOAD_RETRIES"
+  validate_uint CODEX_TOOL_DOWNLOAD_RETRY_DELAY "$DOWNLOAD_RETRY_DELAY"
+  validate_uint CODEX_TOOL_DOWNLOAD_STALL_TIME "$DOWNLOAD_STALL_TIME"
+  validate_uint CODEX_TOOL_DOWNLOAD_MAX_TIME "$DOWNLOAD_MAX_TIME"
+  ensure_layout
+  lock_manager
+  ensure_command_links
+
+  local cmd="${1:-help}"
+  case "$cmd" in
+    install)
+      [[ $# -eq 2 ]] || die "usage: codex-tool install X.Y.Z"
+      install_version "$2" ;;
+    update)
+      [[ $# -eq 1 ]] || die "usage: codex-tool update"
+      local latest; latest="$(latest_stable_version)"
+      log "latest stable Codex version: $latest"
+      install_version "$latest" ;;
+    delete)
+      [[ $# -eq 2 ]] || die "usage: codex-tool delete X.Y.Z"
+      delete_version "$2" ;;
+    switch)
+      [[ $# -eq 2 ]] || die "usage: codex-tool switch X.Y.Z"
+      switch_version "$2" ;;
+    list)
+      [[ $# -eq 1 ]] || die "usage: codex-tool list"
+      list_versions ;;
+    clean)
+      local yes=0; shift
+      while (($#)); do case "$1" in --yes|-y) yes=1;; *) die "unknown clean option: $1";; esac; shift; done
+      clean_data "$yes" ;;
+    prune)
+      local yes=0 force=0; shift
+      while (($#)); do case "$1" in --yes|-y) yes=1;; --force) force=1;; *) die "unknown prune option: $1";; esac; shift; done
+      prune_all "$yes" "$force" ;;
+    daemon)
+      [[ $# -ge 2 ]] || die "usage: codex-tool daemon {status|repair [--yes]}"
+      case "$2" in
+        status)
+          [[ $# -eq 2 ]] || die "usage: codex-tool daemon status"
+          daemon_status
+          ;;
+        repair)
+          local yes=0
+          shift 2
+          while (($#)); do case "$1" in --yes|-y) yes=1;; *) die "unknown daemon repair option: $1";; esac; shift; done
+          daemon_repair "$yes"
+          ;;
+        *) die "usage: codex-tool daemon {status|repair [--yes]}" ;;
+      esac ;;
+    auth)
+      [[ $# -eq 2 ]] || die "usage: codex-tool auth {login|status|logout}"
+      case "$2" in
+        login) auth_login ;;
+        status) auth_status ;;
+        logout) auth_logout ;;
+        *) die "usage: codex-tool auth {login|status|logout}" ;;
+      esac ;;
+    version|--version|-V)
+      printf 'codex-tool %s\n' "$TOOL_VERSION" ;;
+    help|-h|--help)
+      usage ;;
+    *) die "unknown command: $cmd (run 'codex-tool help')" ;;
+  esac
+}
+
+main "$@"
+\n'
+  done < <(find "$VERSIONS_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+
+  rm -f -- "$CURRENT_LINK"
+  rm -rf -- "$VERSIONS_DIR" "$DOWNLOADS_DIR"
+  mkdir -p -- "$VERSIONS_DIR" "$DOWNLOADS_DIR"
+  log "pruned all codex-tool managed Codex versions and download cache"
+  if (( DAEMON_WAS_RUNNING )); then
+    log "managed app-server daemon was stopped and intentionally left stopped; CODEX_HOME daemon packages/state were preserved"
+  else
+    log "codex-tool and all CODEX_HOME data, including daemon packages/state, were preserved"
+  fi
+}
+
+daemon_protected_socket_path() {
+  local advertised="$CODEX_DATA_DIR/app-server-control/app-server-control.sock"
+  local parent
+  parent="$(dirname "$advertised")"
+  mkdir -p -- "$parent"
+  chmod 0700 -- "$parent" 2>/dev/null || true
+  python3 - "$parent" "$(basename "$advertised")" <<'PY'
+import hashlib, os, sys
+parent=os.path.realpath(sys.argv[1])
+path=os.path.join(parent, sys.argv[2])
+root=os.path.realpath("/tmp")
+print(os.path.join(root, f"codex-daemon-{os.geteuid()}", hashlib.sha256(os.fsencode(path)).hexdigest()))
+PY
+}
+
+unix_socket_connectable() {
+  local path="$1"
+  python3 - "$path" <<'PY' >/dev/null 2>&1
+import socket, sys
+s=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(0.25)
+try:
+    s.connect(sys.argv[1])
+except OSError:
+    raise SystemExit(1)
+else:
+    raise SystemExit(0)
+finally:
+    s.close()
+PY
+}
+
+daemon_terminate_managed_processes() {
+  local pids pid deadline remaining
+  pids="$(daemon_managed_pids)"
+  [[ -n "$pids" ]] || return 0
+
+  warn "terminating stale managed Codex app-server process(es): $(tr '\n' ' ' <<<"$pids" | sed 's/[[:space:]]\+/ /g')"
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    kill -TERM "$pid" 2>/dev/null || true
+  done <<<"$pids"
+
+  deadline=$((SECONDS + 5))
+  while (( SECONDS < deadline )); do
+    remaining="$(daemon_managed_pids)"
+    [[ -z "$remaining" ]] && return 0
+    sleep 1
+  done
+
+  remaining="$(daemon_managed_pids)"
+  if [[ -n "$remaining" ]]; then
+    warn "forcing termination of stale managed Codex app-server process(es): $(tr '\n' ' ' <<<"$remaining" | sed 's/[[:space:]]\+/ /g')"
+    while IFS= read -r pid; do
+      [[ -n "$pid" ]] || continue
+      kill -KILL "$pid" 2>/dev/null || true
+    done <<<"$remaining"
+    sleep 1
+  fi
+
+  remaining="$(daemon_managed_pids)"
+  [[ -z "$remaining" ]] || { warn "managed app-server processes are still running: $remaining"; return 1; }
+}
+
+daemon_cleanup_transient_state() {
+  local state="$CODEX_DATA_DIR/app-server-daemon"
+  local control="$CODEX_DATA_DIR/app-server-control"
+  local advertised="$control/app-server-control.sock"
+  local physical shared owner mode
+
+  physical="$(daemon_protected_socket_path)"
+  if [[ -e "$physical" || -S "$physical" || -L "$physical" ]]; then
+    if unix_socket_connectable "$physical"; then
+      warn "refusing to remove active physical daemon socket: $physical"
+      return 1
+    fi
+    shared="$(dirname "$physical")"
+    if [[ -d "$shared" ]]; then
+      owner="$(stat -c '%u' "$shared" 2>/dev/null || true)"
+      mode="$(stat -c '%a' "$shared" 2>/dev/null || true)"
+      [[ "$owner" == "$UID" && "$mode" == "700" ]] || {
+        warn "refusing to modify unsafe daemon socket directory: $shared (owner=$owner mode=$mode)"
+        return 1
+      }
+    fi
+    rm -f -- "$physical" "$physical.lock"
+  fi
+
+  if [[ -e "$advertised" || -S "$advertised" || -L "$advertised" ]]; then
+    if unix_socket_connectable "$advertised"; then
+      warn "refusing to remove active advertised daemon socket: $advertised"
+      return 1
+    fi
+    rm -f -- "$advertised"
+  fi
+  rm -f -- "$control/app-server-startup.lock"
+
+  local name
+  for name in app-server.pid app-server-updater.pid daemon.pid daemon-updater.pid; do
+    rm -f -- "$state/$name"
+  done
+
+  # Preserve settings.json, logs, loaded-threads.json and managed packages.
+  return 0
+}
+
+daemon_status() {
+  daemon_snapshot
+  printf 'Daemon support: %s\n' "$([[ "$DAEMON_SUPPORTED" == "1" ]] && printf yes || printf no)"
+  printf 'Daemon state:   %s\n' "$DAEMON_STATE"
+  [[ -z "$DAEMON_BIN" ]] || printf 'Control binary: %s\n' "$DAEMON_BIN"
+  [[ -z "$DAEMON_BACKEND" ]] || printf 'Backend:        %s\n' "$DAEMON_BACKEND"
+
+  if [[ -s "$DAEMON_LAST_JSON" ]]; then
+    local managed_path managed_version app_version socket_path
+    managed_path="$(daemon_json_field "$DAEMON_LAST_JSON" managedCodexPath)"
+    managed_version="$(daemon_json_field "$DAEMON_LAST_JSON" managedCodexVersion)"
+    app_version="$(daemon_json_field "$DAEMON_LAST_JSON" appServerVersion)"
+    socket_path="$(daemon_json_field "$DAEMON_LAST_JSON" socketPath)"
+    [[ -z "$managed_path" ]] || printf 'Managed binary: %s\n' "$managed_path"
+    [[ -z "$managed_version" ]] || printf 'Managed version:%s%s\n' " " "$managed_version"
+    [[ -z "$app_version" ]] || printf 'Running version:%s%s\n' " " "$app_version"
+    [[ -z "$socket_path" ]] || printf 'Control socket: %s\n' "$socket_path"
+  fi
+
+  local pids
+  pids="$(daemon_managed_pids)"
+  [[ -z "$pids" ]] || printf 'Managed PIDs:   %s\n' "$(tr '\n' ' ' <<<"$pids" | sed 's/[[:space:]]\+/ /g')"
+  if [[ "$DAEMON_STATE" == "stale" || "$DAEMON_STATE" == "unknown" ]]; then
+    [[ ! -s "$DAEMON_LAST_ERR" ]] || printf 'Last error:     %s\n' "$(tr '\n' ' ' < "$DAEMON_LAST_ERR" | sed 's/[[:space:]]\+/ /g' | cut -c1-500)"
+  fi
+}
+
+daemon_repair() {
+  local yes="$1"
+  daemon_snapshot
+  case "$DAEMON_STATE" in
+    running)
+      log "managed Codex app-server daemon is healthy; no repair is required"
+      return 0
+      ;;
+    unmanaged-running)
+      die "an unmanaged app-server is running; codex-tool will not terminate or repair it"
+      ;;
+    stopped)
+      log "managed Codex app-server daemon is stopped and reports healthy lifecycle state; no repair is required"
+      return 0
+      ;;
+    unsupported)
+      die "no daemon-capable Codex CLI is available"
+      ;;
+  esac
+
+  confirm_or_die "$yes" "Repair stale Codex app-server daemon state? This may terminate stale managed app-server processes."
+
+  local should_restart=0
+  if daemon_has_processes || daemon_pid_records_present || \
+     [[ -e "$CODEX_DATA_DIR/app-server-control/app-server-control.sock" || -L "$CODEX_DATA_DIR/app-server-control/app-server-control.sock" ]]; then
+    should_restart=1
+  fi
+
+  local binary
+  binary="$(daemon_find_control_binary 2>/dev/null || true)"
+  [[ -n "$binary" ]] || die "no daemon-capable Codex binary is available for repair"
+
+  make_work_dir
+  local out="$WORK_DIR/daemon-repair-stop.$$.json" err="$WORK_DIR/daemon-repair-stop.$$.stderr"
+  if daemon_lifecycle "$binary" stop "$out" "$err"; then
+    log "official daemon stop completed during repair"
+  else
+    warn "official daemon stop failed; continuing with conservative stale-process recovery"
+    [[ ! -s "$err" ]] || warn "daemon stop: $(tr '\n' ' ' < "$err" | sed 's/[[:space:]]\+/ /g' | cut -c1-500)"
+  fi
+
+  daemon_terminate_managed_processes || die "unable to terminate stale managed app-server processes"
+  daemon_cleanup_transient_state || die "unable to clean stale daemon runtime state safely"
+
+  if (( should_restart )); then
+    binary="$(daemon_find_control_binary 2>/dev/null || true)"
+    [[ -n "$binary" ]] || die "transient daemon state was cleaned, but no daemon-capable binary is available to restart it"
+    out="$WORK_DIR/daemon-repair-start.$$.json"
+    err="$WORK_DIR/daemon-repair-start.$$.stderr"
+    if ! daemon_lifecycle "$binary" start "$out" "$err"; then
+      [[ ! -s "$err" ]] || warn "daemon start: $(tr '\n' ' ' < "$err" | sed 's/[[:space:]]\+/ /g' | cut -c1-500)"
+      die "daemon runtime state was cleaned but app-server could not be restarted"
+    fi
+    local status
+    status="$(daemon_json_field "$out" status)"
+    case "$status" in
+      started|alreadyRunning|running|restarted)
+        log "managed Codex app-server daemon repaired and running"
+        ;;
+      *)
+        die "daemon restart after repair returned unexpected status: ${status:-unknown}"
+        ;;
+    esac
+  else
+    log "stale daemon runtime state cleaned; daemon remains stopped"
+  fi
+}
+
+auth_login() {
+  [[ -t 0 && -t 2 ]] || die "auth login requires an interactive terminal"
+  make_work_dir
+  local out="$WORK_DIR/auth-login.json"
+  print_github_token_help
+  printf '\nPaste GitHub token (input hidden): ' >&2
+  local token=""
+  IFS= read -r -s token
+  printf '\n' >&2
+  [[ -n "$token" ]] || die "empty token"
+  validate_github_token_text "$token" || die "token contains whitespace"
+
+  local body="$WORK_DIR/auth-login-body.json"
+  local headers="$WORK_DIR/auth-login.headers"
+  local err="$WORK_DIR/auth-login.stderr"
+  local result rc status msg
+  result="$(github_api_once "$API_BASE/releases/latest" "$body" "$headers" "$err" normal "$token")"
+  rc="$(sed -n '1p' <<<"$result")"
+  status="$(sed -n '2p' <<<"$result")"
+  if [[ "$rc" == "0" && "$status" =~ ^2[0-9][0-9]$ ]]; then
+    save_github_token "$token"
+    log "GitHub authentication verified against openai/codex release API"
+    return 0
+  fi
+  msg="$(github_error_message "$body")"
+  [[ -n "$msg" ]] && warn "GitHub: $msg"
+  [[ -s "$err" ]] && warn "curl: $(tr '\n' ' ' < "$err" | sed 's/[[:space:]]\+/ /g' | cut -c1-500)"
+  die "GitHub token verification failed (curl exit $rc, HTTP $status); token was not saved"
+}
+
+auth_status() {
+  printf 'GitHub auth source: %s' "$(github_token_source)"
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    printf ' (environment token takes precedence over saved token)\n'
+  else
+    printf '\n'
+  fi
+}
+
+auth_logout() {
+  if [[ -f "$GITHUB_TOKEN_FILE" || -L "$GITHUB_TOKEN_FILE" ]]; then
+    rm -f -- "$GITHUB_TOKEN_FILE"
+    log "removed saved GitHub token: $GITHUB_TOKEN_FILE"
+  else
+    log "no codex-tool saved GitHub token found"
+  fi
+  [[ -z "${GITHUB_TOKEN:-}" ]] || warn "GITHUB_TOKEN is still set in the current environment and will continue to take precedence."
+}
+
+main() {
+  ensure_supported_platform
+  need_cmd curl; need_cmd python3; need_cmd tar; need_cmd sha256sum; need_cmd find; need_cmd sort; need_cmd stat
+  init_curl_compat
+  validate_uint CODEX_TOOL_API_TIMEOUT "$API_TIMEOUT"
+  validate_uint CODEX_TOOL_CONNECT_TIMEOUT "$CONNECT_TIMEOUT"
+  validate_uint CODEX_TOOL_DOWNLOAD_RETRIES "$DOWNLOAD_RETRIES"
+  validate_uint CODEX_TOOL_DOWNLOAD_RETRY_DELAY "$DOWNLOAD_RETRY_DELAY"
+  validate_uint CODEX_TOOL_DOWNLOAD_STALL_TIME "$DOWNLOAD_STALL_TIME"
+  validate_uint CODEX_TOOL_DOWNLOAD_MAX_TIME "$DOWNLOAD_MAX_TIME"
+  ensure_layout
+  lock_manager
+  ensure_command_links
+
+  local cmd="${1:-help}"
+  case "$cmd" in
+    install)
+      [[ $# -eq 2 ]] || die "usage: codex-tool install X.Y.Z"
+      install_version "$2" ;;
+    update)
+      [[ $# -eq 1 ]] || die "usage: codex-tool update"
+      local latest; latest="$(latest_stable_version)"
+      log "latest stable Codex version: $latest"
+      install_version "$latest" ;;
+    delete)
+      [[ $# -eq 2 ]] || die "usage: codex-tool delete X.Y.Z"
+      delete_version "$2" ;;
+    switch)
+      [[ $# -eq 2 ]] || die "usage: codex-tool switch X.Y.Z"
+      switch_version "$2" ;;
+    list)
+      [[ $# -eq 1 ]] || die "usage: codex-tool list"
+      list_versions ;;
+    clean)
+      local yes=0; shift
+      while (($#)); do case "$1" in --yes|-y) yes=1;; *) die "unknown clean option: $1";; esac; shift; done
+      clean_data "$yes" ;;
+    prune)
+      local yes=0 force=0; shift
+      while (($#)); do case "$1" in --yes|-y) yes=1;; --force) force=1;; *) die "unknown prune option: $1";; esac; shift; done
+      prune_all "$yes" "$force" ;;
+    daemon)
+      [[ $# -ge 2 ]] || die "usage: codex-tool daemon {status|repair [--yes]}"
+      case "$2" in
+        status)
+          [[ $# -eq 2 ]] || die "usage: codex-tool daemon status"
+          daemon_status
+          ;;
+        repair)
+          local yes=0
+          shift 2
+          while (($#)); do case "$1" in --yes|-y) yes=1;; *) die "unknown daemon repair option: $1";; esac; shift; done
+          daemon_repair "$yes"
+          ;;
+        *) die "usage: codex-tool daemon {status|repair [--yes]}" ;;
+      esac ;;
+    auth)
+      [[ $# -eq 2 ]] || die "usage: codex-tool auth {login|status|logout}"
+      case "$2" in
+        login) auth_login ;;
+        status) auth_status ;;
+        logout) auth_logout ;;
+        *) die "usage: codex-tool auth {login|status|logout}" ;;
+      esac ;;
+    version|--version|-V)
+      printf 'codex-tool %s\n' "$TOOL_VERSION" ;;
+    help|-h|--help)
+      usage ;;
+    *) die "unknown command: $cmd (run 'codex-tool help')" ;;
+  esac
+}
+
+main "$@"
+ | sort -Vr || true)
+  if [[ -n "$active_pids" ]]; then
+    warn "refusing to prune Codex versions still used by running process(es):"
+    printf '%s' "$active_pids" >&2
+    if (( DAEMON_WAS_RUNNING )); then
+      warn "the managed daemon was stopped for safety and will now be restored because prune was aborted."
+      daemon_restore_after_mutation || true
+    fi
+    return 1
+  fi
 
   if [[ -L "$CODEX_COMMAND" || ( -f "$CODEX_COMMAND" && "$force" == "1" ) ]]; then rm -f -- "$CODEX_COMMAND"; fi
   rm -f -- "$CURRENT_LINK"

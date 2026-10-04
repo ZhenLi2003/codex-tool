@@ -1802,10 +1802,14 @@ clean_data() {
   if ! daemon_stop_for_mutation; then
     return 1
   fi
+  local restore_daemon="$DAEMON_WAS_RUNNING"
 
   local rc=0
   session_admin_run clean 1 "" stdio || rc=$?
 
+  # session_admin_run performs its own daemon snapshot, so restore the original
+  # transaction state before asking the lifecycle layer to bring the daemon back.
+  DAEMON_WAS_RUNNING="$restore_daemon"
   if ! daemon_restore_after_mutation; then
     warn "session cleanup completed or partially completed, but the managed daemon could not be restored."
     rc=1

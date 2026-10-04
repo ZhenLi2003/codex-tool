@@ -1,4 +1,4 @@
-# codex-tool 1.9.0 — Usage Guide
+# codex-tool 1.9.1 — Usage Guide
 
 A lightweight version manager for the OpenAI Codex CLI standalone Linux x86_64 package.
 
@@ -125,7 +125,7 @@ If restoration fails, the selected CLI remains active, the command returns failu
 
 An unmanaged app-server is never terminated automatically. Stale or unknown daemon state causes mutation commands to fail closed and direct the user to `codex-tool daemon repair`.
 
-### clean / prune in 1.9.0
+### clean / prune in 1.9.x
 
 `CODEX_HOME` is treated as Codex-owned state. codex-tool does not directly delete rollout/session directories or SQLite databases.
 
@@ -179,7 +179,25 @@ Transient/internal loaded workers that have no persisted thread record after dae
 codex-tool daemon status
 ```
 
-Reports lifecycle support, classified daemon state, control binary/backend, managed/running versions and socket path when available, plus managed process IDs for diagnostic use.
+Reports lifecycle support, classified daemon state, control binary/backend, managed/running versions and socket path when available, plus managed process IDs.
+
+In 1.9.1, a running lifecycle is followed by a protocol compatibility probe. codex-tool calls `experimentalFeature/list` on both the shared daemon and a temporary stdio app-server from the active CLI, then compares the four shared-service feature settings used by Codex TUI compatibility checks:
+
+```text
+api_key_model_discovery
+code_mode_host
+auth_elicitation
+mcp_oauth_refresh_coordination
+```
+
+Typical healthy output includes:
+
+```text
+Compatibility:  healthy
+Compat detail:  experimentalFeature/list and shared feature settings match the current CLI
+```
+
+A daemon can therefore be reported as lifecycle `running` but compatibility `broken` or `feature-mismatch`. This catches cases where the control socket is alive but normal `codex` would fail with `Experimental feature request failed`.
 
 ### daemon repair
 
@@ -187,7 +205,15 @@ Reports lifecycle support, classified daemon state, control binary/backend, mana
 codex-tool daemon repair
 ```
 
-This is the explicit stale-state recovery path. It first tries the official daemon stop command. If that fails, it identifies only user-owned Codex app-server processes, terminates them, validates the protected `/tmp/codex-daemon-UID` directory before touching it, and removes transient PID/socket/lock state. It preserves:
+This is the explicit runtime and protocol recovery path. A lifecycle-running daemon is first checked with the same `experimentalFeature/list` compatibility probe used by `daemon status`. If it is compatible, no repair is performed. If it is incompatible, repair:
+
+1. establishes a fresh stop boundary and removes only verified managed runtime processes/transient state;
+2. starts the daemon again through the official lifecycle, which resets stale launch feature overrides on a fresh start;
+3. reruns the protocol compatibility probe;
+4. if compatibility is still broken, runs `codex app-server daemon update --from-cli --yes` to replace/pin the managed daemon package from the active complete CLI package;
+5. starts it again and requires another compatibility check.
+
+The package-level repair is a second-stage fallback rather than the default action. Repair preserves:
 
 ```text
 CODEX_HOME/app-server-daemon/settings.json
@@ -242,7 +268,7 @@ CODEX_TOOL_LOCK_TIMEOUT=10
 If the lock cannot be acquired within that interval, codex-tool exits with a diagnostic instead of blocking indefinitely. When a valid holder PID file is available, the error includes the holder PID and command line.
 
 
-## Lock, stop, and subprocess isolation in 1.9.0
+## Lock, stop, and subprocess isolation in 1.9.x
 
 The 1.7.1 bounded runtime lock remains in place. 1.8.0 additionally prevents lock-file descriptor inheritance.
 
@@ -251,7 +277,7 @@ Every Codex child invoked for daemon lifecycle or session administration closes 
 This prevents a detached app-server or updater from retaining the codex-tool `flock` after the original manager process exits.
 
 
-## stop in 1.9.0
+## stop in 1.9.x
 
 ```bash
 codex-tool stop

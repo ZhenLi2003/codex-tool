@@ -2,20 +2,20 @@
 set -Eeuo pipefail
 umask 022
 
-TOOL_HOME="\${CODEX_TOOL_HOME:-$HOME/scripts/codex-tool}"
-BIN_DIR="\${CODEX_TOOL_BIN_DIR:-$HOME/.local/bin}"
-CODEX_DATA_DIR="\${CODEX_HOME:-$HOME/.codex}"
+TOOL_HOME="${CODEX_TOOL_HOME:-$HOME/scripts/codex-tool}"
+BIN_DIR="${CODEX_TOOL_BIN_DIR:-$HOME/.local/bin}"
+CODEX_DATA_DIR="${CODEX_HOME:-$HOME/.codex}"
 FORCE=0
 RESTART_DAEMON_AFTER_INSTALL=0
 
-[[ "\${1:-}" != "--force" ]] || { FORCE=1; shift; }
+[[ "${1:-}" != "--force" ]] || { FORCE=1; shift; }
 [[ $# -eq 0 ]] || { echo "usage: ./install.sh [--force]" >&2; exit 2; }
 
 log()  { printf '==> %s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 
-SRC_DIR="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [[ -x "$SRC_DIR/codex-tool" ]] || die "codex-tool payload is missing"
 
 need_cmd() {
@@ -24,7 +24,7 @@ need_cmd() {
 
 manager_lock_files() {
   local runtime_owner=""
-  if [[ -n "\${XDG_RUNTIME_DIR:-}" && -d "$XDG_RUNTIME_DIR" && ! -L "$XDG_RUNTIME_DIR" ]]; then
+  if [[ -n "${XDG_RUNTIME_DIR:-}" && -d "$XDG_RUNTIME_DIR" && ! -L "$XDG_RUNTIME_DIR" ]]; then
     runtime_owner="$(stat -c '%u' "$XDG_RUNTIME_DIR" 2>/dev/null || true)"
     if [[ "$runtime_owner" == "$UID" ]]; then
       printf '%s\n' "$XDG_RUNTIME_DIR/codex-tool/manager.lock"
@@ -64,7 +64,7 @@ lock_holder_pids() {
     [[ -r "$proc/status" && -d "$proc/fd" ]] || continue
     proc_uid="$(awk '/^Uid:/{print $2; exit}' "$proc/status" 2>/dev/null || true)"
     [[ "$proc_uid" == "$UID" ]] || continue
-    pid="\${proc##*/}"
+    pid="${proc##*/}"
 
     for fd in "$proc"/fd/*; do
       [[ -e "$fd" || -L "$fd" ]] || continue
@@ -85,7 +85,7 @@ pid_cmdline() {
 pid_exe() {
   local pid="$1" exe=""
   exe="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
-  printf '%s\n' "\${exe% (deleted)}"
+  printf '%s\n' "${exe% (deleted)}"
 }
 
 is_codex_tool_holder() {
@@ -147,7 +147,7 @@ except Exception:
 }
 
 wait_for_lock_free() {
-  local lock_file="$1" seconds="\${2:-10}" i
+  local lock_file="$1" seconds="${2:-10}" i
   for ((i=0; i<seconds*10; i++)); do
     lock_is_free "$lock_file" && return 0
     sleep 0.1

@@ -1854,7 +1854,7 @@ def main():
     parser.add_argument("--socket")
     parser.add_argument(
         "--mode",
-        choices=("scan-clean", "clean", "scan-prune", "prepare-prune", "delete-ids"),
+        choices=("scan-clean", "capture-active", "clean", "clean-stopped", "scan-prune", "prepare-prune", "delete-ids"),
         required=True,
     )
     parser.add_argument("--all", action="store_true")
@@ -1863,10 +1863,37 @@ def main():
 
     client = Client(args.codex, args.transport, args.socket)
     try:
-        if args.mode in ("scan-clean", "clean"):
+        if args.mode in ("scan-clean", "capture-active", "clean", "clean-stopped"):
             threads = list_threads(client)
             print_clean_scan(threads, args.all)
+            active_ids = [
+                t["id"] for t in threads
+                if t.get("id") and status_type(t) == "active"
+            ]
+
             if args.mode == "scan-clean":
+                return 0
+
+            if args.mode == "capture-active":
+                write_ids(args.ids_file, active_ids)
+                print(f"Captured active/background thread IDs: {len(active_ids)}")
+                return 0
+
+            if args.mode == "clean-stopped":
+                preserve = set() if args.all else set(read_ids(args.ids_file))
+                ids = [
+                    t["id"] for t in threads
+                    if t.get("id") and (args.all or t["id"] not in preserve)
+                ]
+                deleted, pending, errors = delete_many(client, ids)
+                print(f"Deleted threads: {len(deleted)}")
+                if preserve and not args.all:
+                    print(f"Preserved threads that were active before daemon stop: {len(preserve)}")
+                if pending:
+                    print(f"Could not delete: {len(pending)}", file=sys.stderr)
+                    for tid in pending:
+                        print(f"warning: {tid}: {errors.get(tid, 'unknown error')}", file=sys.stderr)
+                    return 3
                 return 0
 
             targets = list(threads) if args.all else [
@@ -2073,66 +2100,63 @@ daemon_stop_for_prune() {
 clean_data() {
   local yes="$1" all_threads="$2" dry_run="$3"
 
-  log "scanning persisted Codex sessions through app-server"
-  session_admin_run scan-clean "$all_threads" "" auto || return 1
+  make_work_dir
+  local active_ids="$WORK_DIR/clean-active-before-stop.txt"
+  : > "$active_ids"
+
+  if [[ -n "$PRELOCK_ACTIVE_IDS_FILE" && -f "$PRELOCK_ACTIVE_IDS_FILE" ]]; then
+    cp -- "$PRELOCK_ACTIVE_IDS_FILE" "$active_ids"
+    if (( PRELOCK_ACTIVE_CAPTURE_FAILED )) && (( ! all_threads )); then
+      warn "active-thread snapshot before legacy-lock recovery was incomplete."
+      warn "refusing default clean because previously active threads could be misclassified."
+      warn "rerun after daemon recovery, or use 'codex-tool clean --all' if deleting all threads is intended."
+      return 1
+    fi
+    log "using active-thread snapshot captured before legacy daemon-lock recovery"
+  else
+    log "scanning persisted Codex sessions before daemon stop"
+    session_admin_run capture-active 0 "$active_ids" auto || return 1
+    session_admin_run scan-clean "$all_threads" "" auto || return 1
+  fi
+
   (( dry_run )) && {
-    log "dry run only; no session data was modified"
+    log "dry run only; app-server was not stopped and no session data was modified"
     return 0
   }
 
   if (( all_threads )); then
-    confirm_or_die "$yes" "Delete all persisted Codex sessions? Active/background threads will be interrupted; a managed daemon may be restarted if live state blocks deletion."
+    confirm_or_die "$yes" "Stop Codex app-server and delete all persisted sessions, including threads that are currently active/background?"
   else
-    confirm_or_die "$yes" "Delete inactive persisted Codex sessions? Active/background threads will be preserved."
+    confirm_or_die "$yes" "Stop Codex app-server and delete inactive persisted sessions? Threads that were active before stop will be preserved."
   fi
 
-  if (( ! all_threads )); then
-    session_admin_run clean 0 "" auto
-    return $?
-  fi
-
-  # First attempt is fully online: interrupt active turns and delete through the
-  # existing app-server without disturbing the daemon.
-  if session_admin_run clean 1 "" auto; then
-    return 0
-  fi
-
-  warn "online clean --all could not remove every thread; evaluating managed-daemon fallback."
   daemon_snapshot
+  local restore_daemon=0
+  [[ "$DAEMON_STATE" == "running" ]] && restore_daemon=1
+  (( PRELOCK_DAEMON_WAS_RUNNING )) && restore_daemon=1
+
   case "$DAEMON_STATE" in
-    running)
-      ;;
-    stopped|unsupported)
-      warn "retrying clean --all through an isolated stdio app-server."
-      session_admin_run clean 1 "" stdio
-      return $?
-      ;;
     unmanaged-running)
-      warn "the remaining live threads belong to an unmanaged app-server; codex-tool will not stop it automatically."
-      return 1
-      ;;
-    stale|unknown)
-      warn "daemon state is $DAEMON_STATE; run 'codex-tool daemon repair' before retrying clean --all."
+      warn "an unmanaged app-server is running; clean will not stop it automatically."
       return 1
       ;;
   esac
 
-  log "stopping managed app-server to establish a final clean --all boundary"
-  if ! daemon_stop_for_mutation; then
+  if ! stop_app_server_internal "clean"; then
     return 1
   fi
-  local restore_daemon="$DAEMON_WAS_RUNNING"
 
   local rc=0
-  session_admin_run clean 1 "" stdio || rc=$?
+  session_admin_run clean-stopped "$all_threads" "$active_ids" stdio || rc=$?
 
-  # session_admin_run performs its own daemon snapshot, so restore the original
-  # transaction state before asking the lifecycle layer to bring the daemon back.
-  DAEMON_WAS_RUNNING="$restore_daemon"
-  if ! daemon_restore_after_mutation; then
-    warn "session cleanup completed or partially completed, but the managed daemon could not be restored."
-    rc=1
+  if (( restore_daemon )); then
+    DAEMON_WAS_RUNNING=1
+    if ! daemon_restore_after_mutation; then
+      warn "session cleanup completed or partially completed, but the managed daemon could not be restored."
+      rc=1
+    fi
   fi
+
   return "$rc"
 }
 

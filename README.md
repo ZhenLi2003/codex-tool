@@ -12,6 +12,7 @@ A lightweight version manager for the OpenAI Codex CLI standalone package on **L
 - **Version switching** — keep multiple Codex versions side by side and switch instantly.
 - **Complete modern runtime** — installs the full Codex package, including components such as `codex-code-mode-host`.
 - **Daemon-aware lifecycle** — version activation stops/restores the managed app-server daemon safely, and `clean` no longer deletes daemon state or packages.
+- **Non-blocking read-only commands** — `version`, `help`, `list`, `auth status`, and `daemon status` do not take the exclusive manager lock.
 - **User data preserved** — `~/.codex` configuration, authentication, managed daemon packages, and unknown future state are preserved unless explicitly owned by codex-tool.
 - **Resilient downloads** — large release packages support persistent resume/retry and SHA-256 verification.
 - **GitHub API rate-limit recovery** — if an anonymous proxy exit exhausts GitHub's API quota, codex-tool first retries the metadata request directly; if direct access is unavailable, it can guide you to create a GitHub access token, verify it, save it with mode `0600`, and reuse it for future API requests.
@@ -190,6 +191,22 @@ codex-tool auth logout
 ```
 
 `GITHUB_TOKEN`, when set, takes precedence over the saved token.
+
+## Manager locking
+
+codex-tool 1.7.1 no longer takes an exclusive lock for read-only commands such as:
+
+```bash
+codex-tool version
+codex-tool help
+codex-tool list
+codex-tool auth status
+codex-tool daemon status
+```
+
+Mutation commands use a host-local runtime lock under `$XDG_RUNTIME_DIR/codex-tool` when available, otherwise `/tmp/codex-tool-$UID`. The lock directory must be owned by the current user and is forced to mode `0700`.
+
+Lock acquisition is bounded by `CODEX_TOOL_LOCK_TIMEOUT` (default: 10 seconds). If another mutation still holds the lock, codex-tool reports the holder PID/command when available instead of waiting indefinitely.
 
 ## Documentation
 

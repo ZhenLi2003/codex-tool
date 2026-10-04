@@ -213,7 +213,7 @@ save_github_token() {
   ( umask 077; printf '%s\n' "$token" > "$tmp" )
   chmod 0600 -- "$tmp"
   mv -f -- "$tmp" "$GITHUB_TOKEN_FILE"
-  log "saved GitHub token to $GITHUB_TOKEN_FILE (mode 0600)"
+  log "saved GitHub token to $GITHUB_TOKEN_FILE (mode 0600)" >&2
 }
 
 print_github_token_help() {
@@ -241,7 +241,7 @@ write_curl_auth_config() {
 
 prompt_github_token_and_retry() {
   local url="$1" output="$2" label="$3"
-  [[ -t 0 && -t 1 ]] || return 2
+  [[ -t 0 && -t 2 ]] || return 2
 
   printf '\n' >&2
   print_github_token_help
@@ -382,7 +382,7 @@ github_api_get() {
       return 0
     fi
 
-    if [[ ! -t 0 || ! -t 1 ]]; then
+    if [[ ! -t 0 || ! -t 2 ]]; then
       warn "interactive token setup is unavailable in this session."
       print_github_token_help
       warn "after creating a token, either export GITHUB_TOKEN or run 'codex-tool auth login' in an interactive shell."
@@ -857,7 +857,7 @@ prune_all() {
 }
 
 auth_login() {
-  [[ -t 0 && -t 1 ]] || die "auth login requires an interactive terminal"
+  [[ -t 0 && -t 2 ]] || die "auth login requires an interactive terminal"
   make_work_dir
   local out="$WORK_DIR/auth-login.json"
   print_github_token_help

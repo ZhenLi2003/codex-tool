@@ -98,7 +98,7 @@ codex-tool stop                   停止 managed Codex app-server daemon
 codex-tool clean [--all] [--dry-run] [--yes]
                                   通过 Codex app-server 清理持久化会话；默认只删除
                                   非活跃 thread，--all 会中断并删除后台 thread
-codex-tool prune [--dry-run] [--yes] [--force]
+codex-tool prune [--dry-run] [--purge-history] [--yes] [--force]
                                   删除 loaded/background thread、停止 daemon，并清理
                                   Codex 程序/runtime；保留非活跃历史和用户配置/认证
 codex-tool version                查看 codex-tool 版本
@@ -171,7 +171,7 @@ Codex 用户配置和运行数据仍保存在：
 
 ## Daemon-aware 生命周期
 
-新版 Codex 已经是由长期运行的 app-server、持久化 thread store、SQLite state、writer lock 和 managed daemon package 共同组成的本地运行时。codex-tool 1.9.0 不再把 `CODEX_HOME` 当作可以直接清理的缓存目录。
+新版 Codex 已经是由长期运行的 app-server、持久化 thread store、SQLite state、writer lock 和 managed daemon package 共同组成的本地运行时。codex-tool 1.9.1 将 `CODEX_HOME` 视为 Codex 自己管理的状态树，而不是可直接删除的缓存目录。
 
 对于 `install` / `update` / `switch`，下载、SHA 校验和 package validation 阶段不会打断现有 daemon；真正激活版本时才停止健康的 managed daemon，并在切换后恢复。
 
@@ -214,12 +214,16 @@ codex-tool clean --all
 
 如果仍有前台 Codex 进程正在使用受管理 executable，prune 会 fail closed，不会从运行进程下方删除程序文件。
 
-诊断和 stale-state 修复仍使用：
+1.9.1 的 daemon 诊断进一步检查“协议兼容性”，而不再只看 PID/socket：
 
 ```bash
 codex-tool daemon status
 codex-tool daemon repair
 ```
+
+当 managed app-server 处于 running 时，`daemon status` 会额外调用 `experimentalFeature/list`，并用当前 active CLI 启动一个临时 stdio app-server 作为参照，比较 `api_key_model_discovery`、`code_mode_host`、`auth_elicitation`、`mcp_oauth_refresh_coordination` 四个 shared-service feature。只有 lifecycle 和该兼容性检查都通过，daemon 才会报告为真正可用。
+
+如果 RPC 失败或 feature 设置不兼容，`daemon repair` 会先执行 fresh stop/start。官方 fresh `daemon start` 会清掉旧的 launch-time feature overrides；若仍无法通过检查，则第二阶段调用 `codex app-server daemon update --from-cli --yes`，用当前完整 CLI package 重新对齐 managed daemon package，再启动并重新验证。
 
 ## GitHub API 认证与限流恢复
 

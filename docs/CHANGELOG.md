@@ -2,6 +2,22 @@
 
 This file summarizes the major iterations of `codex-tool`.
 
+## 1.8.0
+
+- Redefined `clean` as Codex session/thread cleanup and `prune` as Codex program/runtime cleanup.
+- Replaced file-based session deletion with official app-server JSON-RPC operations; codex-tool no longer directly removes session rollouts or thread/state SQLite databases.
+- Default `clean` deletes inactive persisted threads through `thread/delete` while preserving active/background threads and keeping a healthy daemon running.
+- Added `clean --all` to locate active turns with `thread/turns/list`, request `turn/interrupt`, wait for threads to leave active state, and then delete their persisted records.
+- Added `clean --dry-run`.
+- Reworked `prune` to enumerate loaded/background threads, request interruption for active work, stop the managed daemon, delete persisted records for those background threads through a temporary stdio app-server, and then remove Codex program/runtime assets.
+- `prune` now removes codex-tool-managed CLI versions/cache plus Codex managed daemon/standalone packages and daemon runtime/control state, while preserving inactive saved history and user config/auth/skills/rules.
+- Added `prune --dry-run` and foreground-Codex process protection.
+- Added handling for transient/internal loaded workers that have no persisted thread record after daemon shutdown.
+- Fixed manager-lock inheritance: daemon lifecycle children and session-management children explicitly close FD 9 before exec.
+- Added explicit parent unlock/close on exit and corrected manager holder PID recording to use the actual shell PID.
+- Retained the bounded host-local runtime `flock` introduced in 1.7.1.
+
+
 ## 1.7.1
 
 - Fixed a startup design issue where every command acquired the same exclusive `flock` before command dispatch.

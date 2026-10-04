@@ -1,4 +1,4 @@
-# codex-tool 1.8.0 — Usage Guide
+# codex-tool 1.9.0 — Usage Guide
 
 A lightweight version manager for the OpenAI Codex CLI standalone Linux x86_64 package.
 
@@ -29,9 +29,11 @@ The installer overwrites the manager script but preserves `versions/`, `current`
 codex-tool install X.Y.Z
 codex-tool update
 codex-tool delete X.Y.Z
+codex-tool stop
 codex-tool clean [--all] [--dry-run] [--yes]
 codex-tool prune [--dry-run] [--yes] [--force]
 codex-tool daemon status
+codex-tool daemon stop
 codex-tool daemon repair [--yes]
 codex-tool list
 codex-tool switch X.Y.Z
@@ -123,7 +125,7 @@ If restoration fails, the selected CLI remains active, the command returns failu
 
 An unmanaged app-server is never terminated automatically. Stale or unknown daemon state causes mutation commands to fail closed and direct the user to `codex-tool daemon repair`.
 
-### clean / prune in 1.8.0
+### clean / prune in 1.9.0
 
 `CODEX_HOME` is treated as Codex-owned state. codex-tool does not directly delete rollout/session directories or SQLite databases.
 
@@ -141,12 +143,13 @@ codex-tool clean --all --yes
 Default behavior:
 
 - enumerate both active and archived persisted threads;
-- classify by current app-server thread status;
-- delete non-active persisted threads through `thread/delete`;
-- preserve active/background threads;
-- keep a healthy daemon running throughout the operation.
+- snapshot the IDs that are active before the stop boundary;
+- stop the managed app-server through the official daemon lifecycle;
+- delete only threads that were already inactive before the stop;
+- preserve the pre-stop active/background thread records;
+- restore the managed daemon when it was running before clean.
 
-With `--all`, active threads are interrupted first. codex-tool finds an in-progress turn through `thread/turns/list`, requests `turn/interrupt`, waits for the thread to leave `active`, then deletes the persisted thread.
+With `--all`, the same stop boundary is used but every persisted thread is deleted, including threads that were active/background before app-server was stopped.
 
 If the online interrupt/delete pass cannot remove every thread because managed live/internal state is still holding ownership, `clean --all` establishes a final boundary by temporarily stopping the managed daemon, retries cleanup through an isolated stdio app-server, then restores the daemon. An unmanaged app-server is never stopped automatically.
 
@@ -241,10 +244,32 @@ CODEX_TOOL_LOCK_TIMEOUT=10
 If the lock cannot be acquired within that interval, codex-tool exits with a diagnostic instead of blocking indefinitely. When a valid holder PID file is available, the error includes the holder PID and command line.
 
 
-## Lock and subprocess isolation in 1.8.0
+## Lock, stop, and subprocess isolation in 1.9.0
 
 The 1.7.1 bounded runtime lock remains in place. 1.8.0 additionally prevents lock-file descriptor inheritance.
 
 Every Codex child invoked for daemon lifecycle or session administration closes manager FD 9 before exec. The temporary Python app-server client is also launched with FD 9 closed, and Python uses `close_fds=True` for Codex children. On codex-tool exit, the parent explicitly unlocks and closes FD 9.
 
 This prevents a detached app-server or updater from retaining the codex-tool `flock` after the original manager process exits.
+
+
+## stop in 1.9.0
+
+```bash
+codex-tool stop
+codex-tool daemon stop
+```
+
+Both commands stop the managed Codex app-server. The top-level `stop` is intentionally not a normal manager mutation: it does not acquire the codex-tool manager lock first.
+
+This makes it usable as a recovery primitive when an older daemon inherited the manager lock file descriptor. Before stopping, codex-tool inspects actual lock holders:
+
+- a real in-flight `codex-tool` mutation causes `stop` to fail closed;
+- verified managed Codex daemon holders are allowed and are stopped;
+- unknown holders cause `stop` to fail closed.
+
+The normal path uses `codex app-server daemon stop`. Stale-state fallback terminates only verified managed Codex app-server/updater processes and then cleans transient PID/socket state.
+
+Mutation commands use the same stop primitive automatically. Before acquiring their manager lock, they also detect the legacy case where a managed daemon itself holds the lock. In that case codex-tool snapshots active and loaded thread IDs, stops the daemon, waits for the lock to become free, and then continues the requested mutation. Version activation and clean restore the daemon afterward when appropriate; prune intentionally leaves it stopped.
+
+The installer performs equivalent legacy-lock recovery before overwriting the installed manager, so upgrading from versions affected by FD inheritance does not require manually killing the daemon.

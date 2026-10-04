@@ -31,7 +31,7 @@ codex-tool update
 codex-tool delete X.Y.Z
 codex-tool stop
 codex-tool clean [--all] [--dry-run] [--yes]
-codex-tool prune [--dry-run] [--yes] [--force]
+codex-tool prune [--dry-run] [--purge-history] [--yes] [--force]
 codex-tool daemon status
 codex-tool daemon stop
 codex-tool daemon repair [--yes]
@@ -151,8 +151,6 @@ Default behavior:
 
 With `--all`, the same stop boundary is used but every persisted thread is deleted, including threads that were active/background before app-server was stopped.
 
-If the online interrupt/delete pass cannot remove every thread because managed live/internal state is still holding ownership, `clean --all` establishes a final boundary by temporarily stopping the managed daemon, retries cleanup through an isolated stdio app-server, then restores the daemon. An unmanaged app-server is never stopped automatically.
-
 #### prune
 
 ```bash
@@ -271,5 +269,9 @@ This makes it usable as a recovery primitive when an older daemon inherited the 
 The normal path uses `codex app-server daemon stop`. Stale-state fallback terminates only verified managed Codex app-server/updater processes and then cleans transient PID/socket state.
 
 Mutation commands use the same stop primitive automatically. Before acquiring their manager lock, they also detect the legacy case where a managed daemon itself holds the lock. In that case codex-tool snapshots active and loaded thread IDs, stops the daemon, waits for the lock to become free, and then continues the requested mutation. Version activation and clean restore the daemon afterward when appropriate; prune intentionally leaves it stopped.
+
+Normal stop mirrors the official Codex lifecycle and stops only app-server. The standalone updater loop is preserved. If an updater created by an older codex-tool release still owns `manager.lock`, codex-tool terminates only that verified lock holder after app-server stop. `prune` and `daemon repair` intentionally terminate the full managed runtime, including the updater.
+
+Legacy-lock recovery is transactional: if it has to stop a previously running daemon before manager-lock acquisition and the later command exits early (for example, an API/download failure), the EXIT cleanup attempts to restore the daemon. This prevents an upgrade/mutation failure from leaving Codex stopped merely because an old release leaked the lock FD.
 
 The installer performs equivalent legacy-lock recovery before overwriting the installed manager, so upgrading from versions affected by FD inheritance does not require manually killing the daemon.

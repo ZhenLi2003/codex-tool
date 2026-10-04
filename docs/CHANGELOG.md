@@ -2,6 +2,17 @@
 
 This file summarizes the major iterations of `codex-tool`.
 
+## 1.6.0
+
+- Added authenticated GitHub API fallback for networks where anonymous proxy egress is rate-limited and direct GitHub access is unavailable.
+- Added interactive guidance to the GitHub personal access token creation page.
+- Added hidden token input and verification against the public `openai/codex` release API before saving.
+- Added persistent token storage under `~/.config/codex-tool/github-token` with mode `0600`.
+- Added `codex-tool auth login|status|logout`.
+- `GITHUB_TOKEN` remains supported and takes precedence over the saved token.
+- Release asset downloads continue to honor the user's existing network/proxy configuration.
+
+
 ## 1.5.1
 
 - Removed the hard dependency on curl `--retry-all-errors`.

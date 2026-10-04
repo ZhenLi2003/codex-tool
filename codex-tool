@@ -985,20 +985,20 @@ stop_app_server_internal() {
       return 1
       ;;
     stale|unknown)
-      warn "managed daemon state is $DAEMON_STATE; attempting conservative managed-process shutdown."
+      warn "managed daemon state is $DAEMON_STATE; attempting conservative app-server shutdown."
       ;;
   esac
 
-  if daemon_has_processes; then
-    (( official_ok )) || warn "official daemon stop did not fully clear managed processes; using verified process fallback."
-    daemon_terminate_managed_processes || return 1
+  if daemon_has_app_server_processes; then
+    (( official_ok )) || warn "official daemon stop did not fully clear app-server; using verified app-server fallback."
+    daemon_terminate_app_server_processes || return 1
   fi
 
   if [[ -e "$CODEX_DATA_DIR/app-server-daemon" || -e "$CODEX_DATA_DIR/app-server-control" ]]; then
-    daemon_cleanup_transient_state || return 1
+    daemon_cleanup_app_server_state || return 1
   fi
 
-  daemon_has_processes && {
+  daemon_has_app_server_processes && {
     warn "managed app-server processes are still running after stop"
     return 1
   }
@@ -1043,15 +1043,25 @@ stop_app_server_command() {
   need_cmd stat
   need_cmd flock
 
-  guard_explicit_stop_against_manager_mutation     || die "refusing to stop app-server while another manager mutation may be in progress"
+  guard_explicit_stop_against_manager_mutation \
+    || die "refusing to stop app-server while another manager mutation may be in progress"
 
-  stop_app_server_internal "explicit codex-tool stop"     || die "unable to stop managed Codex app-server safely"
+  stop_app_server_internal "explicit codex-tool stop" \
+    || die "unable to stop managed Codex app-server safely"
 
   local lock_file
   for lock_file in "$(manager_lock_root)/manager.lock" "$TOOL_HOME/.lock"; do
     [[ -e "$lock_file" || -L "$lock_file" ]] || continue
+
+    if ! manager_lock_is_free "$lock_file"; then
+      warn "manager lock is still held after app-server stop; checking for a legacy updater lock holder"
+      terminate_managed_lock_holders "$lock_file" \
+        || die "unable to release legacy codex-tool manager lock safely: $lock_file"
+    fi
+
     if manager_lock_is_free "$lock_file"; then
-      [[ "$(basename "$lock_file")" != "manager.lock" ]]         || rm -f -- "$(dirname "$lock_file")/manager.pid"
+      [[ "$(basename "$lock_file")" != "manager.lock" ]] \
+        || rm -f -- "$(dirname "$lock_file")/manager.pid"
       [[ "$lock_file" != "$TOOL_HOME/.lock" ]] || rm -f -- "$lock_file"
     fi
   done
@@ -2258,7 +2268,13 @@ daemon_stop_for_prune() {
       return 1
       ;;
   esac
+
   stop_app_server_internal "prune" || return 1
+
+  # prune removes managed runtime packages, so unlike ordinary stop it must
+  # also terminate the detached updater loop before deleting those files.
+  daemon_terminate_managed_processes || return 1
+  daemon_cleanup_transient_state || return 1
   return 0
 }
 

@@ -847,47 +847,80 @@ daemon_lifecycle() {
   return "$rc"
 }
 
+stop_app_server_internal() {
+  local reason="${1:-requested stop}"
+  daemon_snapshot
+
+  local official_ok=0
+  case "$DAEMON_STATE" in
+    running)
+      make_work_dir
+      local out="$WORK_DIR/daemon-stop.$.json"
+      local err="$WORK_DIR/daemon-stop.$.stderr"
+      log "stopping managed Codex app-server ($reason)"
+      if daemon_lifecycle "$DAEMON_BIN" stop "$out" "$err"; then
+        local status
+        status="$(daemon_json_field "$out" status)"
+        case "$status" in
+          stopped|notRunning) official_ok=1 ;;
+          *) warn "daemon stop returned unexpected status: ${status:-unknown}" ;;
+        esac
+      else
+        [[ ! -s "$err" ]] || warn "daemon stop: $(tr '\n' ' ' < "$err" | sed 's/[[:space:]]\+/ /g' | cut -c1-500)"
+      fi
+      ;;
+    stopped|unsupported)
+      official_ok=1
+      ;;
+    unmanaged-running)
+      warn "an unmanaged Codex app-server is running; codex-tool will not terminate it automatically."
+      return 1
+      ;;
+    stale|unknown)
+      warn "managed daemon state is $DAEMON_STATE; attempting conservative managed-process shutdown."
+      ;;
+  esac
+
+  if daemon_has_processes; then
+    (( official_ok )) || warn "official daemon stop did not fully clear managed processes; using verified process fallback."
+    daemon_terminate_managed_processes || return 1
+  fi
+
+  if [[ -e "$CODEX_DATA_DIR/app-server-daemon" || -e "$CODEX_DATA_DIR/app-server-control" ]]; then
+    daemon_cleanup_transient_state || return 1
+  fi
+
+  daemon_has_processes && {
+    warn "managed app-server processes are still running after stop"
+    return 1
+  }
+
+  log "managed Codex app-server is stopped"
+  return 0
+}
+
 daemon_stop_for_mutation() {
   daemon_snapshot
+
+  local should_restore=0
+  [[ "$DAEMON_STATE" == "running" ]] && should_restore=1
+  (( PRELOCK_DAEMON_WAS_RUNNING )) && should_restore=1
+
   case "$DAEMON_STATE" in
-    unsupported|stopped)
-      return 0
-      ;;
     unmanaged-running)
       warn "an unmanaged Codex app-server is running; refusing to mutate Codex state automatically."
       warn "stop that app-server manually, then rerun the codex-tool command."
       return 1
       ;;
-    stale|unknown)
-      warn "Codex app-server daemon state is $DAEMON_STATE; refusing to mutate Codex state."
-      [[ ! -s "$DAEMON_LAST_ERR" ]] || warn "daemon: $(tr '\n' ' ' < "$DAEMON_LAST_ERR" | sed 's/[[:space:]]\+/ /g' | cut -c1-500)"
-      warn "run 'codex-tool daemon repair' and retry."
-      return 1
+    running|stale|unknown)
+      stop_app_server_internal "codex-tool mutation" || return 1
       ;;
-    running)
-      make_work_dir
-      local out="$WORK_DIR/daemon-stop.$$.json" err="$WORK_DIR/daemon-stop.$$.stderr"
-      log "stopping managed Codex app-server daemon before mutation"
-      if ! daemon_lifecycle "$DAEMON_BIN" stop "$out" "$err"; then
-        warn "unable to stop managed Codex app-server daemon safely."
-        [[ ! -s "$err" ]] || warn "daemon stop: $(tr '\n' ' ' < "$err" | sed 's/[[:space:]]\+/ /g' | cut -c1-500)"
-        warn "no Codex mutation was performed; run 'codex-tool daemon repair'."
-        return 1
-      fi
-      local status
-      status="$(daemon_json_field "$out" status)"
-      case "$status" in
-        stopped|notRunning)
-          DAEMON_STATE="stopped"
-          return 0
-          ;;
-        *)
-          warn "daemon stop returned unexpected status: ${status:-unknown}"
-          return 1
-          ;;
-      esac
+    stopped|unsupported)
       ;;
   esac
+
+  DAEMON_WAS_RUNNING="$should_restore"
+  return 0
 }
 
 daemon_restore_after_mutation() {
@@ -915,6 +948,7 @@ daemon_restore_after_mutation() {
   case "$status" in
     started|alreadyRunning|running|restarted)
       log "managed Codex app-server daemon restored"
+      PRELOCK_DAEMON_WAS_RUNNING=0
       return 0
       ;;
     *)
@@ -2026,30 +2060,13 @@ foreground_codex_pids() {
 daemon_stop_for_prune() {
   daemon_snapshot
   case "$DAEMON_STATE" in
-    running)
-      make_work_dir
-      local out="$WORK_DIR/prune-daemon-stop.$$.json"
-      local err="$WORK_DIR/prune-daemon-stop.$$.stderr"
-      log "stopping managed Codex app-server daemon"
-      if ! daemon_lifecycle "$DAEMON_BIN" stop "$out" "$err"; then
-        [[ ! -s "$err" ]] || warn "daemon stop: $(tr '\n' ' ' < "$err" | sed 's/[[:space:]]\+/ /g' | cut -c1-500)"
-        return 1
-      fi
-      ;;
-    stopped|unsupported)
-      ;;
     unmanaged-running)
       warn "an unmanaged Codex app-server is running; prune will not terminate it automatically."
       warn "stop it manually and rerun prune."
       return 1
       ;;
-    stale|unknown)
-      warn "daemon state is $DAEMON_STATE; attempting conservative managed-process cleanup for prune."
-      ;;
   esac
-
-  daemon_terminate_managed_processes || return 1
-  daemon_cleanup_transient_state || return 1
+  stop_app_server_internal "prune" || return 1
   return 0
 }
 

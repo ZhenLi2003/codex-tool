@@ -1,4 +1,4 @@
-# codex-tool 1.5.1 — Usage Guide
+# codex-tool 1.6.0 — Usage Guide
 
 A lightweight version manager for the OpenAI Codex CLI standalone Linux x86_64 package.
 
@@ -9,7 +9,7 @@ A lightweight version manager for the OpenAI Codex CLI standalone Linux x86_64 p
 - `list` is local-only and never queries GitHub.
 - Large release downloads use persistent `.part` files, unlimited total transfer time by default, retry/resume, and SHA-256 verification.
 - Small checksum downloads use script-level retries and do not require curl `--retry-all-errors`, improving compatibility with curl versions older than 7.71.0.
-- GitHub API calls normally honor the user's existing proxy configuration. If GitHub returns a rate-limit `403`, codex-tool explains the condition and retries that API request once with proxy use disabled (`--proxy '' --noproxy '*'`). This fallback is limited to GitHub API metadata requests; release asset downloads continue to use the user's normal network/proxy settings.
+- GitHub API calls use `GITHUB_TOKEN` when set, otherwise a token saved by codex-tool. If an anonymous request receives a rate-limit `403`, codex-tool first retries that API request once with proxy use disabled. If direct access also fails and the shell is interactive, it guides the user through creating, verifying, and securely saving a GitHub access token. Release asset downloads continue to use the user's normal network/proxy settings.
 
 ## Install / overwrite manager
 
@@ -31,6 +31,9 @@ codex-tool clean [--yes]
 codex-tool prune [--yes] [--force]
 codex-tool list
 codex-tool switch X.Y.Z
+codex-tool auth login
+codex-tool auth status
+codex-tool auth logout
 codex-tool version
 ```
 
@@ -50,7 +53,23 @@ warning: direct GitHub API retry succeeded; continuing without changing your pro
 
 The tool does not try to detect whether a proxy exists. It reacts only to a GitHub API rate-limit response. Non-rate-limit `403` responses are reported normally and do not trigger proxy bypass.
 
-If both the normal path and the direct retry fail, no persistent proxy environment variable is changed.
+If both the normal path and the direct retry fail, an interactive shell is offered an authenticated fallback. The token creation page is:
+
+```text
+https://github.com/settings/tokens/new
+```
+
+For public `openai/codex` release metadata, codex-tool does not need repository write access. A classic personal access token with no scopes is sufficient for public information and gives authenticated API rate limits.
+
+The token is entered with terminal echo disabled, verified before saving, then stored at:
+
+```text
+~/.config/codex-tool/github-token
+```
+
+with file mode `0600`. `GITHUB_TOKEN` takes precedence when present.
+
+The tool never changes persistent proxy environment variables.
 
 ## Download tuning
 

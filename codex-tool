@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 022
 
-TOOL_VERSION="1.8.1"
+TOOL_VERSION="1.9.0"
 TOOL_HOME="${CODEX_TOOL_HOME:-$HOME/scripts/codex-tool}"
 VERSIONS_DIR="$TOOL_HOME/versions"
 DOWNLOADS_DIR="$TOOL_HOME/downloads"
@@ -39,6 +39,9 @@ DAEMON_LAST_JSON=""
 DAEMON_LAST_ERR=""
 MANAGER_LOCK_DIR=""
 MANAGER_PID_FILE=""
+PRELOCK_DAEMON_WAS_RUNNING=0
+PRELOCK_ACTIVE_IDS_FILE=""
+PRELOCK_ACTIVE_CAPTURE_FAILED=0
 
 log()  { printf '==> %s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
@@ -147,20 +150,151 @@ ensure_supported_platform() {
 
 ensure_layout() { mkdir -p -- "$TOOL_HOME" "$VERSIONS_DIR" "$DOWNLOADS_DIR" "$LOCAL_BIN"; }
 
-lock_manager() {
-  need_cmd flock
-  need_cmd stat
-  validate_uint CODEX_TOOL_LOCK_TIMEOUT "$LOCK_TIMEOUT"
-
-  local lock_root=""
+manager_lock_root() {
+  local lock_root="" runtime_owner=""
   if [[ -n "${XDG_RUNTIME_DIR:-}" && -d "$XDG_RUNTIME_DIR" && ! -L "$XDG_RUNTIME_DIR" ]]; then
-    local runtime_owner
     runtime_owner="$(stat -c '%u' "$XDG_RUNTIME_DIR" 2>/dev/null || true)"
     if [[ "$runtime_owner" == "$UID" ]]; then
       lock_root="$XDG_RUNTIME_DIR/codex-tool"
     fi
   fi
   [[ -n "$lock_root" ]] || lock_root="/tmp/codex-tool-$UID"
+  printf '%s\n' "$lock_root"
+}
+
+process_cmdline() {
+  local pid="$1"
+  tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true
+}
+
+process_exe() {
+  local pid="$1" exe=""
+  exe="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
+  printf '%s\n' "${exe% (deleted)}"
+}
+
+is_codex_tool_manager_pid() {
+  local pid="$1" cmd
+  cmd="$(process_cmdline "$pid")"
+  [[ "$cmd" =~ (^|[[:space:]])([^[:space:]]*/)?codex-tool([[:space:]]|$) ]]
+}
+
+is_managed_daemon_pid() {
+  local pid="$1" exe cmd
+  exe="$(process_exe "$pid")"
+  cmd="$(process_cmdline "$pid")"
+  case "$exe" in
+    "$VERSIONS_DIR/"*|"$CODEX_DATA_DIR/packages/"*) ;;
+    *) return 1 ;;
+  esac
+  [[ "$cmd" == *"app-server"* || "$cmd" == *"pid-update-loop"* || "$cmd" == *"--managed-daemon"* ]]
+}
+
+manager_lock_holder_pids() {
+  local lock_file="$1"
+  [[ -f "$lock_file" && ! -L "$lock_file" ]] || return 0
+
+  local key proc pid uid fd fd_key
+  key="$(stat -Lc '%d:%i' "$lock_file" 2>/dev/null || true)"
+  [[ -n "$key" ]] || return 0
+
+  for proc in /proc/[0-9]*; do
+    [[ -r "$proc/status" && -d "$proc/fd" ]] || continue
+    uid="$(awk '/^Uid:/{print $2; exit}' "$proc/status" 2>/dev/null || true)"
+    [[ "$uid" == "$UID" ]] || continue
+    pid="${proc##*/}"
+    for fd in "$proc"/fd/*; do
+      [[ -e "$fd" || -L "$fd" ]] || continue
+      fd_key="$(stat -Lc '%d:%i' "$fd" 2>/dev/null || true)"
+      if [[ -n "$fd_key" && "$fd_key" == "$key" ]]; then
+        printf '%s\n' "$pid"
+        break
+      fi
+    done
+  done
+}
+
+manager_lock_is_free() {
+  local lock_file="$1" rc=1
+  [[ -e "$lock_file" || -L "$lock_file" ]] || return 0
+  [[ -f "$lock_file" && ! -L "$lock_file" ]] || return 1
+
+  exec 8>>"$lock_file"
+  if flock -n -x 8; then
+    flock -u 8 2>/dev/null || true
+    rc=0
+  fi
+  exec 8>&-
+  return "$rc"
+}
+
+wait_manager_lock_free() {
+  local lock_file="$1" seconds="${2:-10}" i
+  for ((i=0; i<seconds*10; i++)); do
+    manager_lock_is_free "$lock_file" && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+capture_active_threads_before_prelock_stop() {
+  make_work_dir
+  PRELOCK_ACTIVE_IDS_FILE="$WORK_DIR/prelock-active-threads.txt"
+  : > "$PRELOCK_ACTIVE_IDS_FILE"
+  if ! session_admin_run capture-active 0 "$PRELOCK_ACTIVE_IDS_FILE" auto; then
+    PRELOCK_ACTIVE_CAPTURE_FAILED=1
+    warn "could not snapshot active threads before stopping a legacy lock-holding daemon"
+    return 1
+  fi
+  return 0
+}
+
+recover_daemon_inherited_manager_lock() {
+  local lock_file="$1"
+  manager_lock_is_free "$lock_file" && return 0
+
+  local pids pid
+  pids="$(manager_lock_holder_pids "$lock_file" | sort -u)"
+  [[ -n "$pids" ]] || return 1
+
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    if is_codex_tool_manager_pid "$pid"; then
+      return 1
+    fi
+    if ! is_managed_daemon_pid "$pid"; then
+      return 1
+    fi
+  done <<<"$pids"
+
+  warn "manager lock is inherited by a managed Codex daemon; stopping app-server to recover it"
+  warn "legacy lock holder PID(s): $(tr '\n' ' ' <<<"$pids" | sed 's/[[:space:]]\+/ /g')"
+
+  PRELOCK_DAEMON_WAS_RUNNING=1
+  capture_active_threads_before_prelock_stop || true
+
+  if ! stop_app_server_internal "legacy manager-lock recovery"; then
+    warn "unable to stop the managed daemon holding the legacy manager lock"
+    return 1
+  fi
+
+  if ! wait_manager_lock_free "$lock_file" 10; then
+    warn "managed daemon stopped, but the legacy manager lock is still held"
+    return 1
+  fi
+
+  rm -f -- "$(dirname "$lock_file")/manager.pid"
+  log "released legacy daemon-held codex-tool manager lock"
+  return 0
+}
+
+lock_manager() {
+  need_cmd flock
+  need_cmd stat
+  validate_uint CODEX_TOOL_LOCK_TIMEOUT "$LOCK_TIMEOUT"
+
+  local lock_root
+  lock_root="$(manager_lock_root)"
 
   if [[ -e "$lock_root" || -L "$lock_root" ]]; then
     [[ -d "$lock_root" && ! -L "$lock_root" ]] \
@@ -170,7 +304,7 @@ lock_manager() {
       || die "unable to create manager lock directory: $lock_root"
   fi
 
-  local owner mode
+  local owner mode lock_file
   owner="$(stat -c '%u' "$lock_root" 2>/dev/null || true)"
   [[ "$owner" == "$UID" ]] \
     || die "manager lock directory is not owned by the current user: $lock_root"
@@ -182,17 +316,30 @@ lock_manager() {
 
   MANAGER_LOCK_DIR="$lock_root"
   MANAGER_PID_FILE="$lock_root/manager.pid"
-  exec 9>"$lock_root/manager.lock"
+  lock_file="$lock_root/manager.lock"
+  [[ ! -L "$lock_file" ]] \
+    || die "manager lock file must not be a symlink: $lock_file"
 
+  recover_daemon_inherited_manager_lock "$lock_file" || true
+
+  exec 9>"$lock_file"
   if ! flock -w "$LOCK_TIMEOUT" -x 9; then
-    local holder=""
+    local holders holder details=""
+    holders="$(manager_lock_holder_pids "$lock_file" | sort -u)"
+    if [[ -n "$holders" ]]; then
+      while IFS= read -r holder; do
+        [[ -n "$holder" ]] || continue
+        details+="PID $holder: $(process_cmdline "$holder")"$'\n'
+      done <<<"$holders"
+      die "unable to acquire codex-tool manager lock within ${LOCK_TIMEOUT}s; holder(s): ${details//$'\n'/; }"
+    fi
+
+    holder=""
     if [[ -f "$MANAGER_PID_FILE" ]]; then
       IFS= read -r holder < "$MANAGER_PID_FILE" || true
     fi
     if [[ "$holder" =~ ^[0-9]+$ && -r "/proc/$holder/cmdline" ]]; then
-      local holder_cmd
-      holder_cmd="$(tr '\0' ' ' < "/proc/$holder/cmdline" 2>/dev/null || true)"
-      die "unable to acquire codex-tool manager lock within ${LOCK_TIMEOUT}s; holder PID $holder: ${holder_cmd:-unknown command}"
+      die "unable to acquire codex-tool manager lock within ${LOCK_TIMEOUT}s; holder PID $holder: $(process_cmdline "$holder")"
     fi
     die "unable to acquire codex-tool manager lock within ${LOCK_TIMEOUT}s; another codex-tool mutation may still be running"
   fi

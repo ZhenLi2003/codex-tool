@@ -12,6 +12,7 @@
 - **支持多版本切换**：可同时保留多个 Codex 版本，并快速切换当前版本。
 - **安装完整运行时**：使用完整 Codex package，包括 `codex-code-mode-host` 等现代组件。
 - **感知后台 daemon 生命周期**：版本激活时安全停止/恢复 managed app-server，`clean` 不再删除 daemon 状态或 package。
+- **只读命令不再被全局锁阻塞**：`version`、`help`、`list`、`auth status`、`daemon status` 不获取独占 manager lock。
 - **保留用户数据**：`~/.codex` 中的配置、认证、daemon package 以及未来未知状态默认保留。
 - **适合不稳定网络**：大文件支持断点续传、自动重试和 SHA-256 校验。
 - **自动处理 GitHub API 限流场景**：如果共享代理出口耗尽匿名 API 配额，工具会先尝试直连；若直连不可用，则在交互终端中引导创建 GitHub access token，隐藏输入并验证后，以 `0600` 权限保存，后续 API 请求自动复用。
@@ -203,6 +204,32 @@ codex-tool auth logout
 ```
 
 如设置了环境变量 `GITHUB_TOKEN`，其优先级高于工具保存的 token。
+
+## Manager 锁机制
+
+codex-tool 1.7.1 对只读命令不再获取独占锁：
+
+```bash
+codex-tool version
+codex-tool help
+codex-tool list
+codex-tool auth status
+codex-tool daemon status
+```
+
+需要修改版本或运行状态的命令才获取 manager lock。锁优先存放于：
+
+```text
+$XDG_RUNTIME_DIR/codex-tool
+```
+
+如果不可用，则使用：
+
+```text
+/tmp/codex-tool-$UID
+```
+
+锁目录必须属于当前用户，并强制为 `0700`。锁等待由 `CODEX_TOOL_LOCK_TIMEOUT` 控制，默认 10 秒；超时后会明确报错，并在可用时显示持锁 PID/命令，不再无限卡住。
 
 ## 文档
 

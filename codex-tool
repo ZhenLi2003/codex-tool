@@ -70,10 +70,10 @@ Usage:
                                     Delete persisted Codex sessions through the official
                                     app-server API. Default: inactive threads only.
                                     --all also interrupts/deletes background threads.
-  codex-tool prune [--dry-run] [--yes] [--force]
+  codex-tool prune [--dry-run] [--purge-history] [--yes] [--force]
                                     Delete all loaded/background threads, stop the daemon,
-                                    remove Codex program/runtime assets, and preserve
-                                    inactive session history plus user config/auth.
+                                    and remove Codex program/runtime assets. Inactive saved
+                                    history is preserved unless --purge-history is used.
   codex-tool list                   Show current and locally installed versions only
   codex-tool switch X.Y.Z           Safely activate an installed version with daemon
                                     stop/restore when a managed daemon is running
@@ -1973,7 +1973,7 @@ clean_data() {
 }
 
 prune_all() {
-  local yes="$1" force="$2" dry_run="$3"
+  local yes="$1" force="$2" dry_run="$3" purge_history="${4:-0}"
 
   if [[ -e "$CODEX_COMMAND" && ! -L "$CODEX_COMMAND" ]]; then
     if [[ -f "$CODEX_COMMAND" ]]; then
@@ -1991,6 +1991,11 @@ prune_all() {
     die "close those Codex sessions before prune"
   fi
 
+  if (( purge_history )); then
+    log "scanning all persisted Codex sessions for --purge-history"
+    session_admin_run scan-clean 1 "" auto || return 1
+  fi
+
   log "scanning loaded/background Codex threads"
   session_admin_run scan-prune 0 "" auto || return 1
 
@@ -1999,16 +2004,35 @@ prune_all() {
     printf '  %s\n' "$VERSIONS_DIR" "$CURRENT_LINK" "$DOWNLOADS_DIR" "$CODEX_COMMAND"
     printf '  %s\n' "$CODEX_DATA_DIR/packages/app-server-daemon" "$CODEX_DATA_DIR/packages/standalone"
     printf '  %s\n' "$CODEX_DATA_DIR/app-server-daemon" "$CODEX_DATA_DIR/app-server-control"
+    if (( purge_history )); then
+      log "dry run: all persisted session history would also be deleted through the official thread API"
+    else
+      log "dry run: inactive saved session history would be preserved"
+    fi
     log "dry run only; no threads, daemon state, or program files were modified"
     return 0
   fi
 
-  confirm_or_die "$yes" "Delete all loaded/background Codex threads, stop the daemon, and remove Codex program/runtime assets? Inactive saved history and user config/auth will be preserved."
+  if (( purge_history )); then
+    confirm_or_die "$yes" "Delete ALL Codex sessions (including active/background threads), stop the daemon, and remove Codex program/runtime assets? User config/auth/skills/rules will be preserved."
+  else
+    confirm_or_die "$yes" "Delete all loaded/background Codex threads, stop the daemon, and remove Codex program/runtime assets? Inactive saved history and user config/auth will be preserved."
+  fi
+
+  if (( purge_history )); then
+    log "purging all persisted Codex sessions before program removal"
+    clean_data 1 1 0 || {
+      warn "full session purge did not complete; prune aborted before program/runtime removal"
+      return 1
+    }
+  fi
 
   make_work_dir
   local ids_file="$WORK_DIR/prune-background-threads.txt"
   : > "$ids_file"
 
+  # Even after --purge-history, rescan the daemon in case a transient/background
+  # thread appeared between the cleanup and the prune boundary.
   session_admin_run prepare-prune 0 "$ids_file" auto || return 1
 
   daemon_snapshot
@@ -2055,8 +2079,13 @@ prune_all() {
     "$CODEX_DATA_DIR/app-server-daemon" \
     "$CODEX_DATA_DIR/app-server-control"
 
-  log "pruned Codex program/runtime assets and all loaded/background thread records"
-  log "inactive saved session history, configuration, authentication, skills, rules, and other user state were preserved"
+  if (( purge_history )); then
+    log "pruned Codex program/runtime assets and purged persisted session history"
+  else
+    log "pruned Codex program/runtime assets and all loaded/background thread records"
+    log "inactive saved session history was preserved"
+  fi
+  log "configuration, authentication, skills, rules, and other user-owned state were preserved"
 }
 
 daemon_protected_socket_path() {
@@ -2416,18 +2445,19 @@ main() {
       ;;
     prune)
       init_manager_mutation
-      local yes=0 force=0 dry_run=0
+      local yes=0 force=0 dry_run=0 purge_history=0
       shift
       while (($#)); do
         case "$1" in
           --yes|-y) yes=1 ;;
           --force) force=1 ;;
           --dry-run) dry_run=1 ;;
+          --purge-history) purge_history=1 ;;
           *) die "unknown prune option: $1" ;;
         esac
         shift
       done
-      prune_all "$yes" "$force" "$dry_run"
+      prune_all "$yes" "$force" "$dry_run" "$purge_history"
       ;;
     daemon)
       [[ $# -ge 2 ]] || die "usage: codex-tool daemon {status|repair [--yes]}"

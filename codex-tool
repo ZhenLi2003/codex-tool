@@ -51,7 +51,7 @@ cleanup() {
   if [[ -n "$MANAGER_PID_FILE" && -f "$MANAGER_PID_FILE" ]]; then
     local holder=""
     IFS= read -r holder < "$MANAGER_PID_FILE" || true
-    [[ "$holder" != "$" ]] || rm -f -- "$MANAGER_PID_FILE"
+    [[ "$holder" != "$$" ]] || rm -f -- "$MANAGER_PID_FILE"
   fi
   if [[ -e "/proc/$/fd/9" ]]; then
     flock -u 9 2>/dev/null || true
@@ -197,7 +197,7 @@ lock_manager() {
     die "unable to acquire codex-tool manager lock within ${LOCK_TIMEOUT}s; another codex-tool mutation may still be running"
   fi
 
-  ( umask 077; printf '%s\n' "$" > "$MANAGER_PID_FILE" )
+  ( umask 077; printf '%s\n' "$$" > "$MANAGER_PID_FILE" )
 }
 
 make_work_dir() {

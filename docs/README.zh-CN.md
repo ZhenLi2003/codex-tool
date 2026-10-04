@@ -194,7 +194,7 @@ codex-tool clean --all
 
 默认 `clean` 删除当前状态不是 active 的持久化 thread，健康的后台 app-server/daemon 保持运行。
 
-`clean --all` 会额外对 active thread 请求 `turn/interrupt`，等待其退出 active 状态，然后通过 `thread/delete` 删除持久化记录。
+`clean --all` 会额外对 active thread 请求 `turn/interrupt`，等待其退出 active 状态，然后通过 `thread/delete` 删除持久化记录。如果 live/internal 状态仍阻止彻底删除，且当前是 managed daemon，codex-tool 会临时停止 daemon，通过隔离的 stdio app-server 重试剩余清理，随后恢复原 daemon。
 
 任何 clean 模式都不会直接删除 `sessions/`、`archived_sessions/`、`thread_history_*.sqlite`、`state_*.sqlite` 或 Codex 锁文件。
 

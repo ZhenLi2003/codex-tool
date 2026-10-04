@@ -1566,10 +1566,18 @@ def main():
         if args.mode in ("scan-prune", "prepare-prune"):
             threads = {t.get("id"): t for t in list_threads(client) if t.get("id")}
             loaded = list_loaded_ids(client)
-            active = [
-                tid for tid in loaded
-                if status_type(threads.get(tid, {})) == "active"
-            ]
+            status_by_id = {}
+            for tid in loaded:
+                thread = threads.get(tid)
+                if thread is not None:
+                    status_by_id[tid] = status_type(thread)
+                    continue
+                try:
+                    status_by_id[tid] = read_status(client, tid)
+                except Exception:
+                    status_by_id[tid] = "unknown"
+
+            active = [tid for tid in loaded if status_by_id.get(tid) == "active"]
             print(f"Loaded/background threads: {len(loaded)}")
             print(f"Active background threads: {len(active)}")
 
@@ -1579,23 +1587,37 @@ def main():
             write_ids(args.ids_file, loaded)
             failed = []
             for tid in active:
-                print(f"==> interrupting background thread {tid}")
+                print(f"==> requesting interrupt for background thread {tid}")
                 if not interrupt_thread(client, tid):
                     failed.append(tid)
             if failed:
                 print(
-                    "error: background thread(s) could not be interrupted: "
+                    "warning: some background threads did not acknowledge turn/interrupt; "
+                    "managed daemon shutdown will provide the final stop boundary: "
                     + " ".join(failed),
                     file=sys.stderr,
                 )
-                return 4
             return 0
 
         if args.mode == "delete-ids":
-            ids = read_ids(args.ids_file)
-            if not ids:
+            requested = read_ids(args.ids_file)
+            if not requested:
                 print("Background thread records to delete: 0")
                 return 0
+
+            persisted = {
+                t.get("id") for t in list_threads(client) if t.get("id")
+            }
+            ids = [tid for tid in requested if tid in persisted]
+            transient = [tid for tid in requested if tid not in persisted]
+            if transient:
+                print(
+                    f"Background threads with no persisted record after daemon stop: {len(transient)}"
+                )
+            if not ids:
+                print("Persisted background thread records to delete: 0")
+                return 0
+
             deleted, pending, errors = delete_many(client, ids)
             print(f"Deleted background thread records: {len(deleted)}")
             if pending:

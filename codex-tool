@@ -586,8 +586,8 @@ daemon_snapshot() {
   DAEMON_SUPPORTED=1
   DAEMON_BIN="$binary"
   make_work_dir
-  DAEMON_LAST_JSON="$WORK_DIR/daemon-version.$.json"
-  DAEMON_LAST_ERR="$WORK_DIR/daemon-version.$.stderr"
+  DAEMON_LAST_JSON="$WORK_DIR/daemon-version.$$.json"
+  DAEMON_LAST_ERR="$WORK_DIR/daemon-version.$$.stderr"
 
   local rc status
   set +e
@@ -655,7 +655,7 @@ daemon_stop_for_mutation() {
       ;;
     running)
       make_work_dir
-      local out="$WORK_DIR/daemon-stop.$.json" err="$WORK_DIR/daemon-stop.$.stderr"
+      local out="$WORK_DIR/daemon-stop.$$.json" err="$WORK_DIR/daemon-stop.$$.stderr"
       log "stopping managed Codex app-server daemon before mutation"
       if ! daemon_lifecycle "$DAEMON_BIN" stop "$out" "$err"; then
         warn "unable to stop managed Codex app-server daemon safely."
@@ -690,7 +690,7 @@ daemon_restore_after_mutation() {
   fi
 
   make_work_dir
-  local out="$WORK_DIR/daemon-start.$.json" err="$WORK_DIR/daemon-start.$.stderr"
+  local out="$WORK_DIR/daemon-start.$$.json" err="$WORK_DIR/daemon-start.$$.stderr"
   log "restoring managed Codex app-server daemon"
   if ! daemon_lifecycle "$binary" start "$out" "$err"; then
     warn "Codex CLI mutation succeeded, but app-server daemon restoration failed."
@@ -722,7 +722,7 @@ switch_version_raw() {
   if [[ "$layout" != "package" ]]; then
     warn "Codex $version uses $layout layout; modern features such as code-mode host may be unavailable. Re-run 'codex-tool install $version' to repair it."
   fi
-  local tmp_link="$TOOL_HOME/.current.$.tmp"
+  local tmp_link="$TOOL_HOME/.current.$$.tmp"
   rm -f -- "$tmp_link"
   ln -s -- "versions/$version" "$tmp_link"
   mv -Tf -- "$tmp_link" "$CURRENT_LINK"

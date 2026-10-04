@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 022
 
-TOOL_VERSION="1.7.1"
+TOOL_VERSION="1.8.0"
 TOOL_HOME="${CODEX_TOOL_HOME:-$HOME/scripts/codex-tool}"
 VERSIONS_DIR="$TOOL_HOME/versions"
 DOWNLOADS_DIR="$TOOL_HOME/downloads"
@@ -53,6 +53,10 @@ cleanup() {
     IFS= read -r holder < "$MANAGER_PID_FILE" || true
     [[ "$holder" != "$" ]] || rm -f -- "$MANAGER_PID_FILE"
   fi
+  if [[ -e "/proc/$/fd/9" ]]; then
+    flock -u 9 2>/dev/null || true
+    exec 9>&-
+  fi
 }
 trap cleanup EXIT
 
@@ -62,11 +66,14 @@ Usage:
   codex-tool install X.Y.Z          Install/repair and activate a stable version
   codex-tool update                 Install/activate the latest stable version
   codex-tool delete X.Y.Z           Delete an installed non-current version
-  codex-tool clean [--yes]          Clear known history/log data while preserving
-                                    config, auth, packages, daemon state and unknown data
-  codex-tool prune [--yes] [--force]
-                                    Stop managed daemon if needed; remove all codex-tool
-                                    managed versions/download cache and codex command link
+  codex-tool clean [--all] [--dry-run] [--yes]
+                                    Delete persisted Codex sessions through the official
+                                    app-server API. Default: inactive threads only.
+                                    --all also interrupts/deletes background threads.
+  codex-tool prune [--dry-run] [--yes] [--force]
+                                    Delete all loaded/background threads, stop the daemon,
+                                    remove Codex program/runtime assets, and preserve
+                                    inactive session history plus user config/auth.
   codex-tool list                   Show current and locally installed versions only
   codex-tool switch X.Y.Z           Safely activate an installed version with daemon
                                     stop/restore when a managed daemon is running
@@ -545,7 +552,7 @@ ensure_command_links() {
 daemon_supports_lifecycle() {
   local binary="$1"
   [[ -x "$binary" ]] || return 1
-  "$binary" app-server daemon --help >/dev/null 2>&1
+  "$binary" app-server daemon --help >/dev/null 2>&1 9>&-
 }
 
 daemon_find_control_binary() {
@@ -647,7 +654,7 @@ daemon_snapshot() {
 
   local rc status
   set +e
-  "$binary" app-server daemon version >"$DAEMON_LAST_JSON" 2>"$DAEMON_LAST_ERR"
+  "$binary" app-server daemon version >"$DAEMON_LAST_JSON" 2>"$DAEMON_LAST_ERR" 9>&-
   rc=$?
   set -e
 
@@ -686,7 +693,8 @@ daemon_lifecycle() {
   local binary="$1" action="$2" output="$3" err="$4"
   local rc
   set +e
-  "$binary" app-server daemon "$action" >"$output" 2>"$err"
+  # Never let a long-lived Codex daemon inherit codex-tool's manager lock FD.
+  "$binary" app-server daemon "$action" >"$output" 2>"$err" 9>&-
   rc=$?
   set -e
   return "$rc"

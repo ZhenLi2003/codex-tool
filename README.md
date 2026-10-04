@@ -11,7 +11,8 @@ A lightweight version manager for the OpenAI Codex CLI standalone package on **L
 - **Simple installation** — only two project scripts are involved: `install.sh` and `codex-tool`.
 - **Version switching** — keep multiple Codex versions side by side and switch instantly.
 - **Complete modern runtime** — installs the full Codex package, including components such as `codex-code-mode-host`.
-- **User data preserved** — `~/.codex` is kept separate from managed program versions.
+- **Daemon-aware lifecycle** — version activation stops/restores the managed app-server daemon safely, and `clean` no longer deletes daemon state or packages.
+- **User data preserved** — `~/.codex` configuration, authentication, managed daemon packages, and unknown future state are preserved unless explicitly owned by codex-tool.
 - **Resilient downloads** — large release packages support persistent resume/retry and SHA-256 verification.
 - **GitHub API rate-limit recovery** — if an anonymous proxy exit exhausts GitHub's API quota, codex-tool first retries the metadata request directly; if direct access is unavailable, it can guide you to create a GitHub access token, verify it, save it with mode `0600`, and reuse it for future API requests.
 
@@ -85,11 +86,14 @@ codex-tool update                 Install/activate the latest stable version
 codex-tool list                   Show current and locally installed versions
 codex-tool switch X.Y.Z           Switch to an installed version
 codex-tool delete X.Y.Z           Delete an installed non-current version
-codex-tool clean [--yes]          Clear Codex data except config.toml and auth.json
+codex-tool clean [--yes]          Clear known history/log data only; preserve config,
+                                  auth, daemon state/packages, and unknown entries
 codex-tool prune [--yes] [--force]
-                                  Remove all managed Codex versions/download cache
-                                  and the managed codex command link
+                                  Stop managed daemon if needed, then remove all
+                                  codex-tool-managed versions/cache and codex link
 codex-tool version                Show codex-tool version
+codex-tool daemon status          Inspect app-server daemon state
+codex-tool daemon repair [--yes]  Repair stale managed daemon runtime state
 codex-tool auth login             Save and verify a GitHub access token
 codex-tool auth status            Show the active GitHub auth source
 codex-tool auth logout            Remove the token saved by codex-tool
@@ -147,6 +151,26 @@ Codex configuration and runtime data remain in:
 ```
 
 Updating the manager or switching Codex versions does not clear that directory.
+
+## Daemon-aware lifecycle
+
+Modern Codex can run a managed background app-server under `CODEX_HOME`. codex-tool 1.7.0 treats that daemon as an independent lifecycle-managed component:
+
+- `install`, `update`, and `switch` perform downloads/verification first, then stop a healthy managed daemon only for the activation transaction and restore it afterward.
+- If daemon restoration fails, the selected CLI remains active, previous versions are retained, and codex-tool reports the failure instead of deleting recovery options.
+- `prune` stops a managed daemon and intentionally leaves it stopped while preserving `CODEX_HOME/packages/app-server-daemon` and daemon settings/state.
+- `clean` uses a delete allowlist. It removes only known history/log data: `sessions/`, `archived_sessions/`, `history.jsonl`, and `log/`.
+- `clean` never wipes the whole `CODEX_HOME`, so `config.toml`, `auth.json`, daemon state, packages, and unknown future Codex entries are preserved.
+- Running Codex processes protect their version directories from `delete`, automatic history pruning, replacement, and `prune`.
+
+Diagnostics and stale-state recovery:
+
+```bash
+codex-tool daemon status
+codex-tool daemon repair
+```
+
+The normal lifecycle commands fail closed when daemon state is stale/unknown or when an unmanaged app-server is running. `daemon repair` is the explicit recovery path for stale managed daemon runtime state.
 
 ## GitHub API authentication
 

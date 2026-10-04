@@ -7,7 +7,7 @@ This file summarizes the major iterations of `codex-tool`.
 - Redefined `clean` as Codex session/thread cleanup and `prune` as Codex program/runtime cleanup.
 - Replaced file-based session deletion with official app-server JSON-RPC operations; codex-tool no longer directly removes session rollouts or thread/state SQLite databases.
 - Default `clean` deletes inactive persisted threads through `thread/delete` while preserving active/background threads and keeping a healthy daemon running.
-- Added `clean --all` to locate active turns with `thread/turns/list`, request `turn/interrupt`, wait for threads to leave active state, and then delete their persisted records.
+- Added `clean --all` to locate active turns with `thread/turns/list`, request `turn/interrupt`, wait for threads to leave active state, and then delete their persisted records. If managed live/internal state still blocks complete deletion, it can temporarily stop the managed daemon, retry through an isolated stdio app-server, and restore the daemon.
 - Added `clean --dry-run`.
 - Reworked `prune` to enumerate loaded/background threads, request interruption for active work, stop the managed daemon, delete persisted records for those background threads through a temporary stdio app-server, and then remove Codex program/runtime assets.
 - `prune` now removes codex-tool-managed CLI versions/cache plus Codex managed daemon/standalone packages and daemon runtime/control state, while preserving inactive saved history and user config/auth/skills/rules.

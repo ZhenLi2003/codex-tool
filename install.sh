@@ -253,6 +253,12 @@ recover_legacy_manager_locks() {
     lock_is_free "$lock_file" \
       || die "legacy codex-tool manager lock is still held after recovery: $lock_file"
 
+    if [[ "$(basename "$lock_file")" == "manager.lock" ]]; then
+      rm -f -- "$(dirname "$lock_file")/manager.pid"
+    elif [[ "$lock_file" == "$TOOL_HOME/.lock" ]]; then
+      rm -f -- "$lock_file"
+    fi
+
     log "released legacy codex-tool manager lock: $lock_file"
   done < <(manager_lock_files | awk '!seen[$0]++')
 

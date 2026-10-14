@@ -748,6 +748,151 @@ managed_link_or_absent() {
   die "$label already exists and is not managed by codex-tool: $link_path"
 }
 
+background_policy_optimized() {
+  [[ -f "$CONFIG_DIR/background/manifest.json" ]]
+}
+
+background_helper() {
+  need_cmd python3
+  local helper="$TOOL_HOME/background.py"
+  [[ -f "$helper" ]] || die "background policy helper missing: $helper; rerun ./install.sh"
+  python3 "$helper" "$1" --codex-home "$CODEX_DATA_DIR" --config-dir "$CONFIG_DIR"
+}
+
+background_apply_policy() {
+  local choice="$1"
+  case "$choice" in
+    optimized)
+      background_helper optimize || return 1
+      ;;
+    native)
+      background_helper native || return 1
+      ;;
+    *)
+      die "internal error: unsupported background mode $choice"
+      ;;
+  esac
+  ensure_command_links
+}
+
+background_supports_launcher() {
+  local binary="$1"
+  [[ -x "$binary" && -x "$TOOL_HOME/codex-launcher" ]] || return 1
+  "$binary" --help 9>&- 2>/dev/null | grep -q -- '--no-daemon'
+}
+
+background_runtime_present() {
+  daemon_snapshot
+  [[ "$DAEMON_STATE" == "running" || "$DAEMON_STATE" == "stale" || "$DAEMON_STATE" == "unmanaged-running" ]] && return 0
+  daemon_has_processes && return 0
+  daemon_pid_records_present && return 0
+  return 1
+}
+
+background_choose_activation() {
+  local version="$1"
+  ACTIVATION_EFFECTIVE="$ACTIVATION_REQUEST"
+  if [[ "$ACTIVATION_REQUEST" == "optimized" ]] && background_runtime_present; then
+    warn "Codex managed background runtime is present (app-server, updater, or recorded processes)."
+    warn "Optimization may interrupt a disconnected/background task."
+    if [[ ! -t 0 || ! -t 2 ]]; then
+      die "background optimization requires confirmation; rerun interactively or use --native"
+    fi
+    local answer=""
+    printf 'Optimize background runtime and continue? [y/N] ' >&2
+    read -r answer || answer=""
+    case "$answer" in
+      y|Y|yes|YES) ACTIVATION_EFFECTIVE="optimized" ;;
+      *) ACTIVATION_EFFECTIVE="native"; warn "background optimization declined; continuing with native Codex behavior" ;;
+    esac
+  fi
+
+  if [[ "$ACTIVATION_EFFECTIVE" == "optimized" ]]; then
+    local target
+    target="$(version_codex_path "$version" 2>/dev/null || true)"
+    [[ -n "$target" ]] || die "Codex version $version is not available for background optimization"
+    background_supports_launcher "$target" || die "Codex $version does not support --no-daemon or the launcher is missing; use --native"
+  fi
+}
+
+background_prepare_activation() {
+  local version="$1"
+  background_choose_activation "$version"
+
+  # Lifecycle boundaries remain mandatory for both modes.
+  daemon_stop_for_mutation || return 1
+
+  if [[ "$ACTIVATION_EFFECTIVE" == "optimized" ]]; then
+    # Official app-server stop does not terminate the separate updater.
+    daemon_terminate_managed_processes || return 1
+    background_apply_policy optimized || return 1
+    # A manager operation must not restart the daemon under optimized policy.
+    DAEMON_WAS_RUNNING=0
+    PRELOCK_DAEMON_WAS_RUNNING=0
+    RESTORE_DAEMON_ON_EXIT=0
+  else
+    background_apply_policy native || return 1
+  fi
+  return 0
+}
+
+background_finish_activation() {
+  if [[ "$ACTIVATION_EFFECTIVE" == "optimized" ]]; then
+    log "Codex foreground optimization active; shared daemon/updater remain stopped"
+    return 0
+  fi
+  daemon_restore_after_mutation
+}
+
+background_status() {
+  ensure_supported_platform
+  need_cmd python3
+  need_cmd stat
+  local description
+  description="$(background_helper status)" || return 1
+  python3 - "$description" <<'PY'
+import json, sys
+state=json.loads(sys.argv[1])
+print("Background policy:  " + state["mode"])
+for k,v in state["configuration"].items():
+    print(f"  {k}: {str(v).lower() if isinstance(v,bool) else v}")
+PY
+  daemon_snapshot
+  printf 'Managed app-server: %s\n' "$DAEMON_STATE"
+  local pids
+  pids="$(daemon_managed_pids)"
+  if [[ -n "$pids" ]]; then
+    printf 'Managed runtime PIDs: %s\n' "$(echo "$pids" | tr '\n' ' ')"
+    background_policy_optimized && warn "optimized policy is configured but managed background processes remain; run codex-tool background optimize"
+  else
+    printf 'Managed runtime PIDs: none\n'
+  fi
+}
+
+background_command() {
+  local action="$1"
+  case "$action" in
+    status) background_status ;;
+    optimize)
+      background_choose_activation "$(current_version 2>/dev/null || true)"
+      # Explicit background optimize should not silently switch to native.
+      [[ "$ACTIVATION_EFFECTIVE" == "optimized" ]] || { warn "optimization cancelled"; return 1; }
+      daemon_stop_for_mutation || return 1
+      daemon_terminate_managed_processes || return 1
+      background_apply_policy optimized || return 1
+      PRELOCK_DAEMON_WAS_RUNNING=0
+      RESTORE_DAEMON_ON_EXIT=0
+      DAEMON_WAS_RUNNING=0
+      log "Codex managed background runtime disabled"
+      ;;
+    native)
+      background_apply_policy native
+      log "Codex original background configuration restored; daemon was not started"
+      ;;
+    *) die "usage: codex-tool background {status|optimize|native}" ;;
+  esac
+}
+
 ensure_command_links() {
   managed_link_or_absent "$TOOL_COMMAND" "$SELF_PATH" "codex-tool command"
   ln -sfn -- "$SELF_PATH" "$TOOL_COMMAND"

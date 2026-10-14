@@ -790,7 +790,7 @@ background_runtime_present() {
 }
 
 background_choose_activation() {
-  local version="$1"
+  local version="$1" staged_binary="${2:-}"
   ACTIVATION_EFFECTIVE="$ACTIVATION_REQUEST"
   if [[ "$ACTIVATION_REQUEST" == "optimized" ]] && background_runtime_present; then
     warn "Codex managed background runtime is present (app-server, updater, or recorded processes)."
@@ -809,15 +809,19 @@ background_choose_activation() {
 
   if [[ "$ACTIVATION_EFFECTIVE" == "optimized" ]]; then
     local target
-    target="$(version_codex_path "$version" 2>/dev/null || true)"
+    if [[ -n "$staged_binary" ]]; then
+      target="$staged_binary"
+    else
+      target="$(version_codex_path "$version" 2>/dev/null || true)"
+    fi
     [[ -n "$target" ]] || die "Codex version $version is not available for background optimization"
     background_supports_launcher "$target" || die "Codex $version does not support --no-daemon or the launcher is missing; use --native"
   fi
 }
 
 background_prepare_activation() {
-  local version="$1"
-  background_choose_activation "$version"
+  local version="$1" staged_binary="${2:-}"
+  background_choose_activation "$version" "$staged_binary"
 
   # Lifecycle boundaries remain mandatory for both modes.
   daemon_stop_for_mutation || return 1
@@ -1315,13 +1319,13 @@ switch_version() {
   validate_version "$version"
   version_codex_path "$version" >/dev/null || die "version $version is not installed"
 
-  daemon_stop_for_mutation || return 1
+  background_prepare_activation "$version" || return 1
   if ! switch_version_raw "$version"; then
     warn "version activation failed; attempting to restore the previous daemon state."
-    daemon_restore_after_mutation || true
+    background_finish_activation || true
     return 1
   fi
-  daemon_restore_after_mutation
+  background_finish_activation
 }
 
 version_running_pids() {
@@ -1611,30 +1615,30 @@ MANIFEST
 
   # Do not stop the daemon during network transfer/verification. Enter the
   # lifecycle transaction only when files and the active selection will change.
-  if ! daemon_stop_for_mutation; then
+  if ! background_prepare_activation "$version" "$stage/bin/codex"; then
     rm -rf -- "$stage"
     return 1
   fi
 
   if ! rm -rf -- "$VERSIONS_DIR/$version"; then
-    daemon_restore_after_mutation || true
+    background_finish_activation || true
     rm -rf -- "$stage"
     return 1
   fi
   if ! mv -- "$stage" "$VERSIONS_DIR/$version"; then
-    daemon_restore_after_mutation || true
+    background_finish_activation || true
     return 1
   fi
   log "installed Codex $version"
 
   if ! switch_version_raw "$version"; then
     warn "Codex package was installed but could not be activated; attempting to restore daemon state."
-    daemon_restore_after_mutation || true
+    background_finish_activation || true
     return 1
   fi
 
   rm -rf -- "$cache_dir"
-  if ! daemon_restore_after_mutation; then
+  if ! background_finish_activation; then
     warn "Codex $version remains active. Previous versions were retained because daemon restoration failed."
     return 1
   fi

@@ -45,7 +45,7 @@ def load_text(path: Path) -> tuple[bool, str, int]:
         fail(f"not a regular file: {path}")
     if path.stat().st_uid != os.getuid():
         fail(f"file is not owned by current user: {path}")
-    return True, path.read_text(encoding="utf-8"), stat.S_IMODE(path.stat().st_mode)
+    return True, path.read_bytes().decode("utf-8"), stat.S_IMODE(path.stat().st_mode)
 
 
 def atomic_write(path: Path, content: str, mode: int = 0o600) -> None:
@@ -245,8 +245,10 @@ def apply(args: argparse.Namespace, optimize: bool) -> int:
     if optimize:
         new_config, toml_originals = modify_toml(old_config, None, optimize=True)
         new_settings, json_originals = modify_settings(old_settings, None, optimize=True)
+        _, original_entries, original_headers = toml_entries(old_config)
         manifest = {
             "schema": 1,
+            "features_header_existed": "features" in original_headers,
             "config_existed": config_existed,
             "settings_existed": settings_existed,
             "config_mode": config_mode,
@@ -268,12 +270,40 @@ def apply(args: argparse.Namespace, optimize: bool) -> int:
         new_config, _ = modify_toml(old_config, manifest["toml_originals"], optimize=False)
         new_settings, _ = modify_settings(old_settings, manifest["json_originals"], optimize=False)
 
+        if not manifest.get("features_header_existed", True):
+            # The manager may have introduced an otherwise empty [features] table.
+            # Remove only a wholly empty table; preserve comments and new user keys.
+            lines = new_config.splitlines(keepends=True)
+            for index, line in enumerate(lines):
+                if not re.match(r"^\s*\[features\]\s*$", line.strip()):
+                    continue
+                end = next((j for j in range(index + 1, len(lines))
+                            if HEADER.match(lines[j].strip())), len(lines))
+                if all(not row.strip() for row in lines[index + 1:end]):
+                    del lines[index:end]
+                break
+            new_config = "".join(lines)
+
+        # If the result has exactly the original logical lines, keep byte-for-byte
+        # formatting from the protected initial backup.
+        backup_config = policy / "backup" / "config.toml"
+        if backup_config.exists():
+            backed_up = backup_config.read_bytes().decode("utf-8")
+            if new_config.strip() == backed_up.strip():
+                new_config = backed_up
+
     # Validate both changes before writing either file.
     original1 = (config_existed, old_config, config_mode)
     original2 = (settings_existed, old_settings, settings_mode)
     try:
-        atomic_write(conf, new_config, config_mode)
-        atomic_write(settings, new_settings, settings_mode)
+        if not optimize and not manifest["config_existed"] and not new_config.strip():
+            conf.unlink(missing_ok=True)
+        else:
+            atomic_write(conf, new_config, config_mode)
+        if not optimize and not manifest["settings_existed"] and json.loads(new_settings) == {}:
+            settings.unlink(missing_ok=True)
+        else:
+            atomic_write(settings, new_settings, settings_mode)
         if optimize:
             atomic_write(manifest_path, json.dumps(manifest, indent=2) + "\n", 0o600)
         else:

@@ -2,6 +2,20 @@
 
 This file summarizes the major iterations of `codex-tool`.
 
+## 2.0.0
+
+- Introduced **Optimized** and **Native** Codex background modes with reversible field-level configuration management.
+- `install`, `update`, and `switch` activate in Optimized mode by default; `--native` restores the original settings and binary link.
+- If managed app-server/updater runtime is detected during default activation, prompt `[y/N]`: yes applies optimization, no continues in Native mode. Fail closed in noninteractive shells.
+- Consolidated public background commands into `background status`, `background optimize`, and `background native`; removed public `stop` and `daemon` commands while retaining internal lifecycle and legacy-lock safeguards.
+- Added a dedicated `background.py` helper using only the Python standard library. Before first optimization it backs up user config and managed daemon settings with private permissions, tracks original field presence and values, and restores only managed fields instead of overwriting unrelated edits.
+- Optimized configuration disables `features.daemon_auto_start`, CLI startup update checks, daemon auto-update, and remote control.
+- Added the lightweight `codex-launcher` for ordinary TUI/resume/fork `--no-daemon` invocations, preserving unwrapped service and noninteractive subcommands.
+- Optimized activation and session cleanup leave the managed daemon stopped; Native mode preserves official behavior and previous service state where safe.
+- Installer now deploys the helper and launcher and will not restart a daemon during legacy-lock migration if optimization is already active.
+- `prune` restores codex-tool-managed user configuration fields when uninstalling Codex runtime.
+- Preserved the bounded manager lock, verified legacy lock-holder recovery, child FD isolation, package integrity checks, and official thread API cleanup.
+
 ## 1.9.1
 
 - Fixed a false-healthy daemon state where `daemon version`, PID, and socket probes succeeded but normal Codex failed during shared-background-server compatibility negotiation with `Experimental feature request failed`.

@@ -95,6 +95,23 @@ Before the first optimization, the manager creates private backups and a manifes
 
 Use `CODEX_TOOL_CONFIG_DIR` and `CODEX_HOME` to override these defaults. Backup directories use `0700` and files `0600`. Restoring Native mode is **field-specific**, preserving other changes made since optimization; conflicting edits to managed fields cause an error instead of a silent overwrite.
 
+## Manual package download (slow server networks)
+
+Both `codex-tool install X.Y.Z` and `codex-tool update` display the official GitHub release asset URL, the expected SHA-256, and the exact path where you may upload a complete package from another device. No new command is necessary.
+
+Example for version `X.Y.Z`:
+
+```text
+Official download:   https://github.com/openai/codex/releases/download/rust-vX.Y.Z/codex-package-x86_64-unknown-linux-musl.tar.gz
+Manual upload path:  ~/scripts/codex-tool/downloads/rust-vX.Y.Z/codex-package-x86_64-unknown-linux-musl.tar.gz
+```
+
+The real output uses your absolute `CODEX_TOOL_HOME` path. Download the official **complete standalone package** on another device, upload it using the exact filename (no `.part` suffix), and rerun the same install command. If the server is still downloading slowly, interrupt that transfer first; its partial file remains available for resume.
+
+Priority is: **verified complete local `.tar.gz` → resumable curl `.tar.gz.part` → fresh curl download**. The local file must be a user-owned regular file, not a symlink. The manager validates the checksum manifest against GitHub's SHA-256 asset digest, checks the local archive's SHA-256, validates the tar members and full package, and verifies the embedded Codex version before activating it.
+
+A corrupt manually uploaded package is **preserved and rejected**, without falling back to another download. A corrupt automatic `.part` file is removed as before. Successful installation removes that version's download cache. The server still needs GitHub release metadata and the small checksum manifest; this is **not** a fully offline installer. For a pinned manually downloaded version, use `install X.Y.Z` rather than `update`, since the latest version can change.
+
 ## Session and runtime cleanup
 
 ```bash

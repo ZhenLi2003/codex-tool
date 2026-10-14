@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 022
 
-TOOL_VERSION="2.0.0"
+TOOL_VERSION="2.1.0"
 TOOL_HOME="${CODEX_TOOL_HOME:-$HOME/scripts/codex-tool}"
 VERSIONS_DIR="$TOOL_HOME/versions"
 DOWNLOADS_DIR="$TOOL_HOME/downloads"
@@ -1491,6 +1491,54 @@ checksum_entry() {
   awk -v asset="$asset" '$2 == asset && length($1)==64 && $1 !~ /[^0-9A-Fa-f]/ {print tolower($1); found=1; exit} END{if(!found) exit 1}' "$manifest"
 }
 
+print_download_instructions() {
+  local version="$1" package_url="$2" expected_sha="$3" upload_path="$4"
+  printf '\n'
+  printf 'Codex release:       rust-v%s\n' "$version"
+  printf 'Official download:   %s\n' "$package_url"
+  printf 'Manual upload path:  %s\n' "$upload_path"
+  printf 'Expected SHA-256:    %s\n' "$expected_sha"
+  printf 'Upload the complete .tar.gz file (not a .part file), then rerun the same install command.\n'
+  printf '\n'
+}
+
+# Set SELECTED_ARCHIVE without forking. Caller has already authenticated the
+# release digest against the official checksum manifest.
+select_local_or_remote_package() {
+  local url="$1" complete="$2" partial="$3" expected_sha="$4"
+  local actual_sha="" owner=""
+  SELECTED_ARCHIVE=""
+
+  if [[ -e "$complete" || -L "$complete" ]]; then
+    [[ -f "$complete" && ! -L "$complete" ]] \
+      || die "manual package must be a regular non-symlink file: $complete"
+    owner="$(stat -c '%u' -- "$complete" 2>/dev/null || true)"
+    [[ "$owner" == "$UID" ]] \
+      || die "manual package is not owned by the current user: $complete"
+
+    log "found manually uploaded Codex package: $complete"
+    actual_sha="$(sha256sum -- "$complete" | awk '{print tolower($1)}')"
+    if [[ "$actual_sha" != "$expected_sha" ]]; then
+      warn "manual package SHA-256 mismatch; uploaded file was preserved."
+      die "expected $expected_sha; got $actual_sha; replace $complete with the correct release asset"
+    fi
+    log "manual package SHA-256 verified: $actual_sha"
+    SELECTED_ARCHIVE="$complete"
+    return 0
+  fi
+
+  resumable_download "$url" "$partial" "$PACKAGE_ASSET" \
+    || die "download failed after all retry attempts; partial file retained at $partial"
+  actual_sha="$(sha256sum -- "$partial" | awk '{print tolower($1)}')"
+  if [[ "$actual_sha" != "$expected_sha" ]]; then
+    warn "downloaded package SHA-256 mismatch; removing corrupted partial file so the next run starts cleanly."
+    rm -f -- "$partial"
+    die "package SHA-256 mismatch (expected $expected_sha, got $actual_sha)"
+  fi
+  log "downloaded package SHA-256 verified: $actual_sha"
+  SELECTED_ARCHIVE="$partial"
+}
+
 validate_tar_safety() {
   local archive="$1"
   python3 - "$archive" <<'PY'
@@ -1574,8 +1622,18 @@ install_version() {
   sums_api_sha="$(sed -n '4p' <<<"$parsed")"
 
   local cache_dir="$DOWNLOADS_DIR/rust-v$version"
-  local archive="$cache_dir/$PACKAGE_ASSET.part"
+  local complete_archive="$cache_dir/$PACKAGE_ASSET"
+  local partial_archive="$cache_dir/$PACKAGE_ASSET.part"
+  local archive="" actual_sha="" owner=""
   local sums="$WORK_DIR/$CHECKSUM_ASSET"
+
+  # Print the official link before any potentially slow asset transfer.
+  print_download_instructions "$version" "$pkg_url" "$pkg_api_sha" "$complete_archive"
+  mkdir -p -- "$cache_dir"
+  [[ -d "$cache_dir" && ! -L "$cache_dir" ]] \
+    || die "unsafe Codex download cache directory: $cache_dir"
+  owner="$(stat -c '%u' -- "$cache_dir" 2>/dev/null || true)"
+  [[ "$owner" == "$UID" ]] || die "download cache is not owned by the current user: $cache_dir"
 
   log "downloading checksum manifest"
   small_download "$sums_url" "$sums" "$CHECKSUM_ASSET" || die "unable to download $CHECKSUM_ASSET"
@@ -1584,15 +1642,9 @@ install_version() {
   manifest_sha="$(checksum_entry "$sums" "$PACKAGE_ASSET")" || die "unable to find $PACKAGE_ASSET in $CHECKSUM_ASSET"
   [[ "$manifest_sha" == "$pkg_api_sha" ]] || die "GitHub package digest and checksum manifest disagree"
 
-  resumable_download "$pkg_url" "$archive" "$PACKAGE_ASSET" || die "download failed after all retry attempts; partial file retained at $archive"
-  local actual_sha
-  actual_sha="$(sha256sum "$archive" | awk '{print tolower($1)}')"
-  if [[ "$actual_sha" != "$pkg_api_sha" ]]; then
-    warn "downloaded package SHA-256 mismatch; removing corrupted partial file so the next run starts cleanly."
-    rm -f -- "$archive"
-    die "package SHA-256 mismatch (expected $pkg_api_sha, got $actual_sha)"
-  fi
-  log "SHA-256 verified: $actual_sha"
+  select_local_or_remote_package "$pkg_url" "$complete_archive" "$partial_archive" "$pkg_api_sha"
+  archive="$SELECTED_ARCHIVE"
+  actual_sha="$pkg_api_sha"
 
   validate_tar_safety "$archive" || die "package archive safety validation failed"
   local stage="$VERSIONS_DIR/.$version.new.$$"

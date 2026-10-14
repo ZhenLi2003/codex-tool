@@ -1,303 +1,178 @@
-# codex-tool 1.9.1 — Usage Guide
+# codex-tool 2.0.0 — Usage Guide
 
-A lightweight version manager for the OpenAI Codex CLI standalone Linux x86_64 package.
+Standalone Codex CLI version management for Linux x86_64, without root or npm.
 
-## Key behavior
-
-- Installs the complete `codex-package-x86_64-unknown-linux-musl.tar.gz`, including modern runtime companions such as `codex-code-mode-host`.
-- Keeps Codex versions under `~/scripts/codex-tool/versions/` and treats modern app-server daemon state under `CODEX_HOME` as lifecycle-managed state rather than disposable cache.
-- `install`, `update`, and `switch` stop/restore a healthy managed daemon only around the activation transaction.
-- Read-only commands do not acquire the exclusive manager lock; mutation commands use a bounded host-local runtime lock.
-- `list` is local-only and never queries GitHub.
-- Large release downloads use persistent `.part` files, unlimited total transfer time by default, retry/resume, and SHA-256 verification.
-- Small checksum downloads use script-level retries and do not require curl `--retry-all-errors`, improving compatibility with curl versions older than 7.71.0.
-- GitHub API calls use `GITHUB_TOKEN` when set, otherwise a token saved by codex-tool. If an anonymous request receives a rate-limit `403`, codex-tool first retries that API request once with proxy use disabled. If direct access also fails and the shell is interactive, it guides the user through creating, verifying, and securely saving a GitHub access token. Release asset downloads continue to use the user's normal network/proxy settings.
-
-## Install / overwrite manager
+## Install the manager
 
 ```bash
+git clone https://github.com/ZhenLi2003/codex-tool.git
+cd codex-tool
 ./install.sh
+codex-tool version
 ```
 
-Use `./install.sh --force` only if `~/.local/bin/codex-tool` is occupied by an unrelated path that you intentionally want to replace.
+The installer copies these files to `~/scripts/codex-tool/`:
 
-The installer overwrites the manager script but preserves `versions/`, `current`, `downloads/`, and `~/.codex`.
+```text
+codex-tool
+background.py
+codex-launcher
+```
+
+It preserves installed versions, caches, and user configuration. It only performs narrowly scoped legacy-lock recovery when an older managed daemon has inherited a manager flock. If Optimized mode is already active, it will not restart the stopped daemon after recovery.
 
 ## Commands
 
 ```text
-codex-tool install X.Y.Z
-codex-tool update
+codex-tool install X.Y.Z [--native]
+codex-tool update [--native]
+codex-tool switch X.Y.Z [--native]
 codex-tool delete X.Y.Z
-codex-tool stop
+codex-tool list
+
+codex-tool background status
+codex-tool background optimize
+codex-tool background native
+
 codex-tool clean [--all] [--dry-run] [--yes]
 codex-tool prune [--dry-run] [--purge-history] [--yes] [--force]
-codex-tool daemon status
-codex-tool daemon stop
-codex-tool daemon repair [--yes]
-codex-tool list
-codex-tool switch X.Y.Z
+
 codex-tool auth login
 codex-tool auth status
 codex-tool auth logout
 codex-tool version
+codex-tool help
 ```
 
-`clean` manages persisted sessions through the Codex app-server protocol. `prune` is the program/runtime cleanup operation: it removes loaded/background thread records, stops the managed daemon, removes codex-tool-managed CLI assets plus Codex managed daemon/standalone runtime packages, and preserves inactive saved history and user configuration/authentication.
+Old `codex-tool stop` and `codex-tool daemon ...` commands are no longer public. Advanced lifecycle commands are provided by the official `codex app-server daemon ...` CLI, which codex-tool uses internally.
 
-## GitHub API rate-limit fallback
+## Default activation policy
 
-Typical output when a shared proxy exit has exhausted GitHub's anonymous API quota:
+`install`, `update`, and `switch` default to Optimized. `--native` selects Native directly.
+
+If a managed daemon, updater, or stale runtime record exists, the default optimization prompts:
 
 ```text
-==> checking the latest stable GitHub release
-warning: latest Codex release was rejected by GitHub API rate limiting (HTTP 403, remaining=0).
-warning: GitHub: API rate limit exceeded for ...
-warning: retrying this GitHub API request once with proxy use disabled; asset downloads will keep the normal proxy configuration.
-warning: direct GitHub API retry succeeded; continuing without changing your proxy environment.
+warning: Codex managed background runtime is present ...
+Optimize background runtime and continue? [y/N]
 ```
 
-The tool does not try to detect whether a proxy exists. It reacts only to a GitHub API rate-limit response. Non-rate-limit `403` responses are reported normally and do not trigger proxy bypass.
+- `y`: stop managed services (this may interrupt disconnected work), apply Optimized, activate the requested version.
+- `n`: do not optimize; continue activation in Native mode.
+- Noninteractive shell with a detected background runtime: fail closed unless `--native` was explicitly given.
 
-If both the normal path and the direct retry fail, an interactive shell is offered an authenticated fallback. The token creation page is:
+Downloads, SHA verification, archive safety checks, and isolated CLI binary validation happen before the activation transaction. Regular manager locks use a bounded `flock` under the user-owned local runtime directory. A real concurrent manager mutation is never killed or bypassed.
 
-```text
-https://github.com/settings/personal-access-tokens/new
-```
-
-For public `openai/codex` release metadata, codex-tool does not need repository write access. GitHub recommends fine-grained personal access tokens; the release endpoints need only `Contents: read`. The URL shown by codex-tool pre-fills that permission and a 90-day expiration.
-
-The token is entered with terminal echo disabled, verified before saving, then stored at:
-
-```text
-~/.config/codex-tool/github-token
-```
-
-with file mode `0600`. `GITHUB_TOKEN` takes precedence when present.
-
-The tool never changes persistent proxy environment variables.
-
-## Download tuning
-
-Defaults:
-
-```text
-CODEX_TOOL_CONNECT_TIMEOUT=30
-CODEX_TOOL_API_TIMEOUT=120
-CODEX_TOOL_DOWNLOAD_RETRIES=8
-CODEX_TOOL_DOWNLOAD_RETRY_DELAY=5
-CODEX_TOOL_DOWNLOAD_STALL_TIME=180
-CODEX_TOOL_DOWNLOAD_MAX_TIME=0
-```
-
-`CODEX_TOOL_DOWNLOAD_MAX_TIME=0` means no total-time limit for each large-file transfer attempt.
-
-
-## Older curl compatibility
-
-`codex-tool` does not require the curl `--retry-all-errors` option. This option was added in curl 7.71.0 and is absent from some older enterprise Linux distributions.
-
-Checksum-manifest downloads are retried by the shell wrapper instead, so older curl builds can still install Codex without upgrading the system curl package.
-
-To inspect the installed curl version:
+## Background policy
 
 ```bash
-curl --version
+codex-tool background status
+codex-tool background optimize
+codex-tool background native
 ```
 
+Optimized manages exactly four entries:
 
-## Daemon-aware lifecycle
+| File | Setting | Optimized |
+|---|---|---|
+| `CODEX_HOME/config.toml` | `check_for_update_on_startup` | `false` |
+| `CODEX_HOME/config.toml` | `features.daemon_auto_start` | `false` |
+| `CODEX_HOME/app-server-daemon/settings.json` | `remoteControlEnabled` | `false` |
+| `CODEX_HOME/app-server-daemon/settings.json` | `updater.autoUpdateEnabled` | `false` |
 
-Codex app-server daemon state is not treated as disposable user cache.
+Other entries, including authentication, models, MCP servers, and skills, remain untouched.
 
-### Version activation
+### Optimized launcher
 
-For `install`, `update`, and `switch`:
+`~/.local/bin/codex` points to `~/scripts/codex-tool/codex-launcher`.
 
-1. download, checksum verification, archive validation, and isolated binary validation happen while the existing daemon keeps running;
-2. immediately before changing the active CLI or replacing an installed version, codex-tool snapshots daemon state;
-3. a healthy managed daemon is stopped through `codex app-server daemon stop`;
-4. the version selection is changed atomically;
-5. if the daemon was previously running, codex-tool starts it again through the official lifecycle command;
-6. history pruning runs only after daemon restoration succeeds.
+- Ordinary interactive `codex [options]` uses `codex --no-daemon [options]`.
+- `codex resume` and `codex fork` receive `--no-daemon`.
+- `codex exec`, `codex agents`, `codex app-server`, other explicit service management, and noninteractive subcommands go to the original binary without injected flags.
+- This is not a global guarantee that every manually requested MCP, subprocess, or agent task will disappear when the terminal closes.
 
-If restoration fails, the selected CLI remains active, the command returns failure, and older versions are retained.
+The complete Codex package is still stored under `versions/X.Y.Z/`. The launcher reads `current`, so version switching does not require modifying the wrapper's source.
 
-An unmanaged app-server is never terminated automatically. Stale or unknown daemon state causes mutation commands to fail closed and direct the user to `codex-tool daemon repair`.
+### Native restoration
 
-### clean / prune in 1.9.x
+Native mode restores the original value or absence of managed fields, then points the `codex` symlink at the native selected binary. It does not automatically start the daemon.
 
-`CODEX_HOME` is treated as Codex-owned state. codex-tool does not directly delete rollout/session directories or SQLite databases.
+On first optimization, the manager saves original files and field metadata:
 
-Session management is performed through app-server JSON-RPC using `thread/list`, `thread/read`, `thread/loaded/list`, `thread/turns/list`, `turn/interrupt`, and `thread/delete`.
+```text
+${CODEX_TOOL_CONFIG_DIR:-~/.config/codex-tool}/background/
+  manifest.json
+  backup/config.toml
+  backup/daemon-settings.json
+```
 
-#### clean
+Private backup permissions are 0700 on directories and 0600 on files. Restoration is field-specific and leaves unrelated user edits intact. If another application changes a managed value during optimization, restoration fails instead of overwriting it without warning. Complex inline TOML feature tables are rejected conservatively rather than incorrectly rewritten.
+
+Run `codex-tool background native` to revert before manually editing managed fields, or resolve a reported conflict explicitly.
+
+## Clean: persisted session cleanup
 
 ```bash
 codex-tool clean --dry-run
 codex-tool clean
 codex-tool clean --all
-codex-tool clean --all --yes
 ```
 
-Default behavior:
+Default clean captures active thread IDs before stopping a managed server and removes only sessions that were inactive before shutdown. `--all` also deletes previously active and background thread history. Both use official Codex thread RPC, not direct SQLite or rollout removal.
 
-- enumerate both active and archived persisted threads;
-- snapshot the IDs that are active before the stop boundary;
-- stop the managed app-server through the official daemon lifecycle;
-- delete only threads that were already inactive before the stop;
-- preserve the pre-stop active/background thread records;
-- restore the managed daemon when it was running before clean.
+If Optimized is active, cleanup does not restore a long-running managed daemon. Native mode preserves the previous daemon running/stopped status where feasible. A dry-run does not stop services.
 
-With `--all`, the same stop boundary is used but every persisted thread is deleted, including threads that were active/background before app-server was stopped.
-
-#### prune
+## Prune: uninstall Codex program/runtime
 
 ```bash
 codex-tool prune --dry-run
 codex-tool prune
-codex-tool prune --yes
+codex-tool prune --purge-history
 ```
 
-Prune is intentionally broader:
+Prune terminates verified managed runtime services, removes the Codex CLI versions/current selection/download caches, `~/.local/bin/codex`, and managed daemon package/control directories. By default inactive saved history remains; `--purge-history` deletes all persisted threads via the official API before program removal.
 
-- refuse to continue while a foreground Codex process is executing from managed program files;
-- enumerate all threads currently loaded by app-server;
-- request interruption for active background turns;
-- stop the managed daemon through the official lifecycle API;
-- use a temporary stdio app-server to delete persisted records belonging to the previously loaded/background threads;
-- remove codex-tool-managed versions/current/download cache and the managed `codex` command;
-- remove `CODEX_HOME/packages/app-server-daemon`, `CODEX_HOME/packages/standalone`, `CODEX_HOME/app-server-daemon`, and `CODEX_HOME/app-server-control`.
+Prune also restores codex-tool-managed background configuration fields before uninstalling the Codex program, so the user's Codex configuration is not left with hidden manager overrides.
 
-Prune preserves inactive saved thread history as well as user configuration, authentication, skills, rules, memories, and other Codex-owned user state.
+Do not prune while foreground Codex processes still reference installed versions.
 
-Transient/internal loaded workers that have no persisted thread record after daemon shutdown are treated as already gone rather than as deletion failures.
-
-### daemon status
+## GitHub API authentication
 
 ```bash
-codex-tool daemon status
+codex-tool auth login
+codex-tool auth status
+codex-tool auth logout
 ```
 
-Reports lifecycle support, classified daemon state, control binary/backend, managed/running versions and socket path when available, plus managed process IDs.
+Saved token: `${CODEX_TOOL_CONFIG_DIR:-~/.config/codex-tool}/github-token`, mode 0600. `GITHUB_TOKEN` overrides the saved token. Public release lookup only needs GitHub read access.
 
-In 1.9.1, a running lifecycle is followed by a protocol compatibility probe. codex-tool calls `experimentalFeature/list` on both the shared daemon and a temporary stdio app-server from the active CLI, then compares the four shared-service feature settings used by Codex TUI compatibility checks:
+If anonymous proxy access exhausts GitHub API rate limits, the manager tries direct API access once and then offers authenticated retry in an interactive TTY. Release assets use the usual configured network path.
+
+## Runtime settings
 
 ```text
-api_key_model_discovery
-code_mode_host
-auth_elicitation
-mcp_oauth_refresh_coordination
-```
-
-Typical healthy output includes:
-
-```text
-Compatibility:  healthy
-Compat detail:  experimentalFeature/list and shared feature settings match the current CLI
-```
-
-A daemon can therefore be reported as lifecycle `running` but compatibility `broken` or `feature-mismatch`. This catches cases where the control socket is alive but normal `codex` would fail with `Experimental feature request failed`.
-
-### daemon repair
-
-```bash
-codex-tool daemon repair
-```
-
-This is the explicit runtime and protocol recovery path. A lifecycle-running daemon is first checked with the same `experimentalFeature/list` compatibility probe used by `daemon status`. If it is compatible, no repair is performed. If it is incompatible, repair:
-
-1. establishes a fresh stop boundary and removes only verified managed runtime processes/transient state;
-2. starts the daemon again through the official lifecycle, which resets stale launch feature overrides on a fresh start;
-3. reruns the protocol compatibility probe;
-4. if compatibility is still broken, runs `codex app-server daemon update --from-cli --yes` to replace/pin the managed daemon package from the active complete CLI package;
-5. starts it again and requires another compatibility check.
-
-The package-level repair is a second-stage fallback rather than the default action. Repair preserves:
-
-```text
-CODEX_HOME/app-server-daemon/settings.json
-CODEX_HOME/app-server-daemon/loaded-threads.json
-CODEX_HOME/app-server-daemon/*.log
-CODEX_HOME/packages/
-```
-
-If stale state indicates a daemon had been active, repair attempts to start it again.
-
-### Running-process protection
-
-A version directory is not removed while a user-owned process still executes a binary from it. This protection applies to explicit `delete`, automatic history pruning, same-version repair/replacement, and full `prune`.
-
-
-## Manager locking in 1.7.1
-
-The manager lock is no longer taken before command dispatch.
-
-Read-only commands:
-
-```text
-version
-help
-list
-auth status
-daemon status
-```
-
-run without the exclusive manager lock. In particular, `version` and `help` also avoid unrelated dependency checks such as curl/tar/sha256sum.
-
-Mutation commands obtain an exclusive lock in a host-local runtime directory:
-
-```text
-$XDG_RUNTIME_DIR/codex-tool
-```
-
-when a user-owned runtime directory is available, otherwise:
-
-```text
-/tmp/codex-tool-$UID
-```
-
-The directory is validated as a real, user-owned directory and forced to mode `0700`.
-
-Default lock wait:
-
-```text
+CODEX_TOOL_HISTORY_KEEP=2
 CODEX_TOOL_LOCK_TIMEOUT=10
+CODEX_TOOL_DOWNLOAD_RETRIES=8
+CODEX_TOOL_DOWNLOAD_RETRY_DELAY=5
+CODEX_TOOL_DOWNLOAD_STALL_TIME=180
+CODEX_TOOL_DOWNLOAD_MAX_TIME=0
+CODEX_TOOL_API_TIMEOUT=120
+CODEX_TOOL_CONNECT_TIMEOUT=30
+CODEX_TOOL_HOME=~/scripts/codex-tool
+CODEX_TOOL_BIN_DIR=~/.local/bin
+CODEX_TOOL_CONFIG_DIR=~/.config/codex-tool
+CODEX_HOME=~/.codex
 ```
 
-If the lock cannot be acquired within that interval, codex-tool exits with a diagnostic instead of blocking indefinitely. When a valid holder PID file is available, the error includes the holder PID and command line.
+The large package downloader maintains resumable `.part` files and verifies SHA-256 using GitHub release metadata and official checksums. Small requests use Bash retries compatible with older curl versions.
 
+## Troubleshooting
 
-## Lock, stop, and subprocess isolation in 1.9.x
-
-The 1.7.1 bounded runtime lock remains in place. 1.8.0 additionally prevents lock-file descriptor inheritance.
-
-Every Codex child invoked for daemon lifecycle or session administration closes manager FD 9 before exec. The temporary Python app-server client is also launched with FD 9 closed, and Python uses `close_fds=True` for Codex children. On codex-tool exit, the parent explicitly unlocks and closes FD 9.
-
-This prevents a detached app-server or updater from retaining the codex-tool `flock` after the original manager process exits.
-
-
-## stop in 1.9.x
-
-```bash
-codex-tool stop
-codex-tool daemon stop
-```
-
-Both commands stop the managed Codex app-server. The top-level `stop` is intentionally not a normal manager mutation: it does not acquire the codex-tool manager lock first.
-
-This makes it usable as a recovery primitive when an older daemon inherited the manager lock file descriptor. Before stopping, codex-tool inspects actual lock holders:
-
-- a real in-flight `codex-tool` mutation causes `stop` to fail closed;
-- verified managed Codex daemon holders are allowed and are stopped;
-- unknown holders cause `stop` to fail closed.
-
-The normal path uses `codex app-server daemon stop`. Stale-state fallback terminates only verified managed Codex app-server/updater processes and then cleans transient PID/socket state.
-
-Mutation commands use the same stop primitive automatically. Before acquiring their manager lock, they also detect the legacy case where a managed daemon itself holds the lock. In that case codex-tool snapshots active and loaded thread IDs, stops the daemon, waits for the lock to become free, and then continues the requested mutation. Version activation and clean restore the daemon afterward when appropriate; prune intentionally leaves it stopped.
-
-Normal stop mirrors the official Codex lifecycle and stops only app-server. The standalone updater loop is preserved. If an updater created by an older codex-tool release still owns `manager.lock`, codex-tool terminates only that verified lock holder after app-server stop. `prune` and `daemon repair` intentionally terminate the full managed runtime, including the updater.
-
-Legacy-lock recovery is transactional: if it has to stop a previously running daemon before manager-lock acquisition and the later command exits early (for example, an API/download failure), the EXIT cleanup attempts to restore the daemon. This prevents an upgrade/mutation failure from leaving Codex stopped merely because an old release leaked the lock FD.
-
-The installer performs equivalent legacy-lock recovery before overwriting the installed manager, so upgrading from versions affected by FD inheritance does not require manually killing the daemon.
+- `codex-tool background status`: inspect policy values and currently detected managed processes.
+- `codex --no-daemon`: force embedded mode for one invocation.
+- `codex app-server daemon version`: official managed service status.
+- `codex app-server daemon stop`: official manual stop, if needed.
+- If a genuine other manager mutation holds the lock, wait for it to complete; do not remove `manager.lock` to force entry.
+- If a legacy managed daemon inherited a lock, the installer/manager attempts recovery only for verifiable managed process holders.
+- User config conflicts under Native restoration are intentionally reported; the original backups are preserved until recovery succeeds.

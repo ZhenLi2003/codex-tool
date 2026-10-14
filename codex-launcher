@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+TOOL_HOME="${CODEX_TOOL_HOME:-$HOME/scripts/codex-tool}"
+TARGET="$TOOL_HOME/current/bin/codex"
+if [[ ! -x "$TARGET" ]]; then
+  TARGET="$TOOL_HOME/current/codex"
+fi
+if [[ ! -x "$TARGET" ]]; then
+  printf 'error: codex-tool managed Codex binary not found: %s\n' "$TARGET" >&2
+  exit 127
+fi
+
+# Direct service management and non-interactive commands to the native binary.
+for arg in "$@"; do
+  case "$arg" in
+    --no-daemon|--remote|--remote=*) exec "$TARGET" "$@" ;;
+  esac
+done
+
+if (( $# == 0 )); then
+  exec "$TARGET" --no-daemon
+fi
+
+case "$1" in
+  resume|fork)
+    subcommand="$1"
+    shift
+    exec "$TARGET" "$subcommand" --no-daemon "$@"
+    ;;
+  exec|e|agents|app-server|remote-control|mcp|mcp-server|login|logout|help|features|completion|cloud|doctor|debug|sandbox|apply|review|archive|unarchive|delete|migrate-rollouts|queue|config|--help|-h|--version|-V|version)
+    exec "$TARGET" "$@"
+    ;;
+  *)
+    exec "$TARGET" --no-daemon "$@"
+    ;;
+esac

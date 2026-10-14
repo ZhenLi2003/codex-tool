@@ -776,9 +776,10 @@ background_apply_policy() {
 }
 
 background_supports_launcher() {
-  local binary="$1"
+  local binary="$1" help_text=""
   [[ -x "$binary" && -x "$TOOL_HOME/codex-launcher" ]] || return 1
-  "$binary" --help 9>&- 2>/dev/null | grep -q -- '--no-daemon'
+  help_text="$("$binary" --help 9>&- 2>/dev/null)" || return 1
+  [[ "$help_text" == *"--no-daemon"* ]]
 }
 
 background_runtime_present() {
@@ -867,10 +868,13 @@ PY
   pids="$(daemon_managed_pids)"
   if [[ -n "$pids" ]]; then
     printf 'Managed runtime PIDs: %s\n' "$(echo "$pids" | tr '\n' ' ')"
-    background_policy_optimized && warn "optimized policy is configured but managed background processes remain; run codex-tool background optimize"
+    if background_policy_optimized; then
+      warn "optimized policy is configured but managed background processes remain; run codex-tool background optimize"
+    fi
   else
     printf 'Managed runtime PIDs: none\n'
   fi
+  return 0
 }
 
 background_command() {

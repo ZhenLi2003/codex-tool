@@ -1,4 +1,4 @@
-# codex-tool 2.0.0 — Usage Guide
+# codex-tool 2.1.0 — Usage Guide
 
 Standalone Codex CLI version management for Linux x86_64, without root or npm.
 
@@ -62,6 +62,33 @@ Optimize background runtime and continue? [y/N]
 - Noninteractive shell with a detected background runtime: fail closed unless `--native` was explicitly given.
 
 Downloads, SHA verification, archive safety checks, and isolated CLI binary validation happen before the activation transaction. Regular manager locks use a bounded `flock` under the user-owned local runtime directory. A real concurrent manager mutation is never killed or bypassed.
+
+## Manual installation from another device
+
+No extra flag is needed. When a Codex package must be downloaded, `install X.Y.Z` and `update` first print:
+
+```text
+Codex release:       rust-vX.Y.Z
+Official download:   https://github.com/openai/codex/releases/download/rust-vX.Y.Z/codex-package-x86_64-unknown-linux-musl.tar.gz
+Manual upload path:  /absolute/path/to/scripts/codex-tool/downloads/rust-vX.Y.Z/codex-package-x86_64-unknown-linux-musl.tar.gz
+Expected SHA-256:    <digest returned by official GitHub release metadata>
+```
+
+Upload the **complete standalone package archive** under that exact filename and path. The `.tar.gz.part` suffix is reserved for resumable curl downloads; never rename an incomplete upload to `.tar.gz`. For safe transfers, upload as `.tar.gz.uploading` and rename to `.tar.gz` on the server after completion.
+
+Then rerun `codex-tool install X.Y.Z`. `update` also checks the local complete archive for the latest stable version, but latest can change between runs; `install X.Y.Z` pins the target release.
+
+Selection order:
+
+1. Existing complete `.tar.gz` — must be a user-owned, non-symlink regular file and have the exact official SHA-256.
+2. Otherwise, existing `.tar.gz.part` — use the current resumable downloader.
+3. Otherwise, download the package normally with curl.
+
+The official release asset SHA-256 is cross-checked with the `codex-package_SHA256SUMS` manifest. All archives (manual and automatic) receive the same tar traversal/special file safety checks, full runtime-package layout checks, isolated executable version check, and daemon-safe activation.
+
+A corrupt manual archive is preserved and rejected, **without** automatic fallback. A corrupt network partial download is removed. The version-specific cache is cleaned only after successful installation. Release metadata and the checksum manifest must still be retrieved from GitHub; manual upload is a workaround for slow large transfers, not a complete offline mode.
+
+You can use `Ctrl+C` to stop a slow large transfer, upload the complete archive, and rerun the command. No watcher or new persistent background process is needed.
 
 ## Background policy
 

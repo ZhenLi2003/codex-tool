@@ -2,241 +2,133 @@
 
 [English README](../README.md)
 
-`codex-tool` 是一个面向 **Linux x86_64 / amd64** 的轻量级 OpenAI Codex CLI 版本管理工具。
+`codex-tool` 是面向 **Linux x86_64** 的 Codex CLI standalone 完整包版本管理器，支持非 root 安装，无需 npm / Node.js。
 
-它适合希望快速安装和管理 Codex CLI、又不想改动系统环境的用户：
+## 核心特性
 
-- **无需 root / sudo 权限**：所有内容均安装在当前用户目录下。
-- **无需 npm / Node.js**：直接从 GitHub Releases 安装官方 standalone Codex 完整包。
-- **安装简单**：项目核心只有 `install.sh` 和 `codex-tool` 两个脚本。
-- **支持多版本切换**：可同时保留多个 Codex 版本，并快速切换当前版本。
-- **安装完整运行时**：使用完整 Codex package，包括 `codex-code-mode-host` 等现代组件。
-- **适配新版 app-server/daemon 生命周期**：版本激活与 managed daemon 协调；会话清理由 Codex 官方 app-server API 完成，不再直接删除 `CODEX_HOME` 内部状态。
-- **只读命令不再被全局锁阻塞**：`version`、`help`、`list`、`auth status`、`daemon status` 不获取独占 manager lock。
-- **明确数据所有权**：codex-tool 直接管理自己的 CLI 版本；持久化 thread 则交给 Codex 官方 app-server RPC 管理。
-- **适合不稳定网络**：大文件支持断点续传、自动重试和 SHA-256 校验。
-- **自动处理 GitHub API 限流场景**：如果共享代理出口耗尽匿名 API 配额，工具会先尝试直连；若直连不可用，则在交互终端中引导创建 GitHub access token，隐藏输入并验证后，以 `0600` 权限保存，后续 API 请求自动复用。
+- 多版本安装、切换、自动更新，默认保留当前版本及最多两个历史版本。
+- **版本安装、更新或切换时默认执行后台优化**。
+- 显式 `--native` 可保留 Codex 官方原生后台行为，并恢复曾由工具修改的配置。
+- 只向普通交互式 Codex、`resume`、`fork` 注入 `--no-daemon`；其他子命令使用真实 Codex 二进制。
+- 使用官方 app-server API 管理历史会话，不直接删除 SQLite / rollout 文件。
+- 保留配置、认证、MCP、skills 和用户数据，支持 SHA-256 校验、断点续传以及 GitHub token。
 
-> `codex-tool` 是社区工具，并非 OpenAI 官方项目。
+> 这是社区工具，不属于 OpenAI 官方项目。
 
-## 快速开始
-
-### 1. 克隆并安装管理器
+## 安装与升级管理器
 
 ```bash
 git clone https://github.com/ZhenLi2003/codex-tool.git
 cd codex-tool
 ./install.sh
-```
-
-如果当前 shell 尚未包含 `~/.local/bin`：
-
-```bash
 export PATH="$HOME/.local/bin:$PATH"
-```
-
-检查管理器版本：
-
-```bash
 codex-tool version
 ```
 
-### 2. 安装 Codex CLI
-
-安装最新稳定版：
-
-```bash
-codex-tool update
-```
-
-或者安装指定稳定版本：
-
-```bash
-codex-tool install 0.154.0
-```
-
-整个过程无需：
-
-```text
-sudo
-root
-npm install -g
-Node.js
-```
+安装器将 `codex-tool`、`background.py` 和 `codex-launcher` 安装到 `~/scripts/codex-tool/`。**只安装管理器不会修改 Codex 用户配置**；激活 Codex 版本时才自动优化。
 
 ## 版本管理
 
-查看本地已安装版本：
-
 ```bash
+codex-tool update
+codex-tool update --native
+codex-tool install 0.162.1
+codex-tool install 0.162.1 --native
+codex-tool switch 0.162.1
+codex-tool switch 0.162.1 --native
 codex-tool list
+codex-tool delete 0.161.0
 ```
 
-切换版本：
+默认 `install/update/switch` 会采用 Optimized（前台优化）模式；`--native` 则采用 Native（官方原生）模式。
+
+如果检测到受管理的 app-server / updater 残留，默认优化会提示：
+
+```text
+Optimize background runtime and continue? [y/N]
+```
+
+- 输入 `y`：停止受管理的后台服务并应用优化，继续版本激活。
+- 输入 `n`：放弃优化，改以 Native 模式继续版本激活。
+- 显式 `--native`：跳过优化确认，直接使用 Native 模式。
+
+**注意**：仍在执行中的后台 agent/task 可能受到服务停止的影响。建议先处理这些任务；存在真实的 codex-tool 并发操作时，工具不会绕过 manager lock。
+
+## 后台管理（新版）
 
 ```bash
-codex-tool switch 0.154.0
+codex-tool background status
+codex-tool background optimize
+codex-tool background native
 ```
 
-删除旧版本：
+Optimized 将以下配置字段设为 `false`：
 
-```bash
-codex-tool delete 0.153.0
+在 `~/.codex/config.toml`：
+
+```toml
+check_for_update_on_startup = false
+
+[features]
+daemon_auto_start = false
 ```
 
-默认会保留当前版本以及最多两个历史版本。
+在 `~/.codex/app-server-daemon/settings.json`：
 
-## 命令概览
+```json
+{
+  "remoteControlEnabled": false,
+  "updater": {
+    "autoUpdateEnabled": false
+  }
+}
+```
+
+以上仅为被管理的字段，其他配置保持不变。
+
+Optimized 模式将 `~/.local/bin/codex` 链接到 `codex-tool` 安装的轻量 launcher：普通交互式 Codex、`resume`、`fork` 会采用 `--no-daemon`，避免自动启动或复用共享 daemon；`exec`、`agents`、`app-server` 等显式功能直接转发给官方 CLI。
+
+Native 模式自动恢复原先的后台配置和原始二进制直连，不会为了切换模式而主动启动 daemon。
+
+## 备份与恢复
+
+首次优化前，工具会在以下目录保存原始配置快照与字段记录：
 
 ```text
-codex-tool install X.Y.Z          安装/修复指定稳定版本并激活
-codex-tool update                 安装并激活最新稳定版本
-codex-tool list                   查看当前版本和本地已安装版本
-codex-tool switch X.Y.Z           切换到已安装版本
-codex-tool delete X.Y.Z           删除非当前版本
-codex-tool stop                   停止 managed Codex app-server daemon
-codex-tool clean [--all] [--dry-run] [--yes]
-                                  通过 Codex app-server 清理持久化会话；默认只删除
-                                  非活跃 thread，--all 会中断并删除后台 thread
-codex-tool prune [--dry-run] [--purge-history] [--yes] [--force]
-                                  删除 loaded/background thread、停止 daemon，并清理
-                                  Codex 程序/runtime；保留非活跃历史和用户配置/认证
-codex-tool version                查看 codex-tool 版本
-codex-tool daemon status          查看 app-server daemon 状态
-codex-tool daemon stop            codex-tool stop 的别名
-codex-tool daemon repair [--yes]  修复 stale managed daemon 运行时状态
-codex-tool auth login             保存并验证 GitHub access token
-codex-tool auth status            查看当前 GitHub 认证来源
-codex-tool auth logout            删除 codex-tool 保存的 token
-codex-tool help                   查看帮助
+~/.config/codex-tool/background/
+├── manifest.json
+└── backup/
+    ├── config.toml
+    └── daemon-settings.json
 ```
 
-## 系统要求
+备份目录权限为 `0700`，文件为 `0600`。恢复 Native 时仅还原工具曾修改的字段，而不是覆盖用户后来改动的模型、MCP 等设置。
 
-目标平台：
+若受管理字段在优化期间被外部程序修改，工具会拒绝覆盖并报告冲突。
 
-```text
-Linux x86_64 / amd64
-```
-
-依赖常见命令行工具：
-
-- Bash
-- `curl`
-- `python3`
-- `tar`
-- `sha256sum`
-- `flock`
-
-不依赖：
-
-- root 权限
-- sudo
-- npm
-- Node.js
-- 系统级 Codex 安装
-
-## 默认安装目录
-
-管理器和 Codex 版本默认存放在：
-
-```text
-~/scripts/codex-tool/
-├── codex-tool
-├── current -> versions/X.Y.Z
-├── downloads/
-└── versions/
-    └── X.Y.Z/
-        ├── bin/codex
-        ├── bin/codex-code-mode-host
-        ├── codex-path/
-        ├── codex-resources/
-        └── ...
-```
-
-命令链接：
-
-```text
-~/.local/bin/codex-tool
-~/.local/bin/codex
-```
-
-Codex 用户配置和运行数据仍保存在：
-
-```text
-~/.codex/
-```
-
-升级管理器、安装新版本或切换版本都不会自动清空该目录。
-
-## Daemon-aware 生命周期
-
-新版 Codex 已经是由长期运行的 app-server、持久化 thread store、SQLite state、writer lock 和 managed daemon package 共同组成的本地运行时。codex-tool 1.9.1 将 `CODEX_HOME` 视为 Codex 自己管理的状态树，而不是可直接删除的缓存目录。
-
-对于 `install` / `update` / `switch`，下载、SHA 校验和 package validation 阶段不会打断现有 daemon；真正激活版本时才停止健康的 managed daemon，并在切换后恢复。
-
-会话管理改为调用 Codex 官方 app-server JSON-RPC：
-
-```text
-thread/list
-thread/read
-thread/loaded/list
-thread/turns/list
-turn/interrupt
-thread/delete
-```
-
-### clean
+## 会话清理与卸载
 
 ```bash
 codex-tool clean --dry-run
 codex-tool clean
 codex-tool clean --all
+
+codex-tool prune --dry-run
+codex-tool prune
+codex-tool prune --purge-history
 ```
 
-默认 `clean` 会先记录 stop 前处于 active 的 thread，然后自动停止 managed app-server；只删除 stop 前已经不活跃的会话，最后在 daemon 原本运行时将其恢复。这样不会因为 stop 后 thread 状态变成 notLoaded 而误删原本活跃的后台会话。
+`clean` 默认清理不活跃会话，`--all` 包含活跃及后台会话。会话删除通过官方 thread API 完成。
 
-`clean --all` 使用同一个 stop 边界，但会删除全部持久化 thread，包括 stop 前处于 active/background 的 thread。
+`prune` 移除 Codex 程序、受管理 daemon/runtime 和后台 thread，默认保留非活跃历史，并在卸载前恢复工具管理的后台配置字段。认证、MCP、skills 等用户数据不会被直接清空。
 
-任何 clean 模式都不会直接删除 `sessions/`、`archived_sessions/`、`thread_history_*.sqlite`、`state_*.sqlite` 或 Codex 锁文件。
+## 锁机制与兼容性
 
-### prune
+工具保留本机有超时的 manager lock。只读命令不获取独占锁。Codex 子进程启动时不继承 manager lock FD；旧版本 daemon 遗留的持锁问题只在确认真实持有进程身份后恢复。
 
-`prune` 定位为“程序与后台 runtime 清理”：
+为保持 CLI 简洁，已移除旧版公开的 `codex-tool stop`、`codex-tool daemon ...` 命令。普通管理使用 `background status/optimize/native`；需要手工排障时仍可使用 Codex 官方 `codex app-server daemon ...` 命令。
 
-1. 通过 app-server 枚举 loaded/background thread；
-2. 对 active turn 请求 interrupt；
-3. 停止 managed daemon；
-4. 使用临时 stdio app-server 删除此前 loaded/background thread 的持久化记录；
-5. 删除 codex-tool 管理的版本/current/download cache、`codex` 链接、managed daemon/standalone package，以及 daemon runtime state。
-
-默认保留已经结束的非活跃会话历史，以及用户配置、认证、skills、rules 等用户状态。
-
-如果仍有前台 Codex 进程正在使用受管理 executable，prune 会 fail closed，不会从运行进程下方删除程序文件。
-
-1.9.1 的 daemon 诊断进一步检查“协议兼容性”，而不再只看 PID/socket：
-
-```bash
-codex-tool daemon status
-codex-tool daemon repair
-```
-
-当 managed app-server 处于 running 时，`daemon status` 会额外调用 `experimentalFeature/list`，并用当前 active CLI 启动一个临时 stdio app-server 作为参照，比较 `api_key_model_discovery`、`code_mode_host`、`auth_elicitation`、`mcp_oauth_refresh_coordination` 四个 shared-service feature。只有 lifecycle 和该兼容性检查都通过，daemon 才会报告为真正可用。
-
-如果 RPC 失败或 feature 设置不兼容，`daemon repair` 会先执行 fresh stop/start。官方 fresh `daemon start` 会清掉旧的 launch-time feature overrides；若仍无法通过检查，则第二阶段调用 `codex app-server daemon update --from-cli --yes`，用当前完整 CLI package 重新对齐 managed daemon package，再启动并重新验证。
-
-## GitHub API 认证与限流恢复
-
-GitHub 未认证 REST API 会按源 IP 限流，共享实验室代理或公共出口比较容易耗尽匿名配额。
-
-当检测到明确的匿名 API rate limit 后，codex-tool 会：
-1. 先仅针对该 API 元数据请求尝试绕过代理直连；
-2. 如果直连失败且当前是交互终端，显示预填充的 GitHub fine-grained token 创建网址；
-3. 只要求仓库 `Contents: read`，以隐藏方式读取 token，并使用当前正常代理路径验证其能访问公开的 `openai/codex` release API；
-4. 验证成功后保存到 `~/.config/codex-tool/github-token`，文件权限为 `0600`；
-5. 后续 API 请求自动使用该 token，从而使用认证后的 GitHub API 配额。
-
-也可以手动管理：
+## GitHub 认证
 
 ```bash
 codex-tool auth login
@@ -244,60 +136,8 @@ codex-tool auth status
 codex-tool auth logout
 ```
 
-如设置了环境变量 `GITHUB_TOKEN`，其优先级高于工具保存的 token。
+支持环境变量 `GITHUB_TOKEN`、本地保存的 token 和代理出口 GitHub API 限流恢复。详细参数见 [使用指南](USAGE.md)。
 
-## Manager 锁机制
+## 许可证
 
-codex-tool 1.7.1 对只读命令不再获取独占锁：
-
-```bash
-codex-tool version
-codex-tool help
-codex-tool list
-codex-tool auth status
-codex-tool daemon status
-```
-
-需要修改版本或运行状态的命令才获取 manager lock。锁优先存放于：
-
-```text
-$XDG_RUNTIME_DIR/codex-tool
-```
-
-如果不可用，则使用：
-
-```text
-/tmp/codex-tool-$UID
-```
-
-锁目录必须属于当前用户，并强制为 `0700`。锁等待由 `CODEX_TOOL_LOCK_TIMEOUT` 控制，默认 10 秒；超时后会明确报错，并在可用时显示持锁 PID/命令，不再无限卡住。
-
-1.9.0 进一步要求所有可能启动或连接长期 Codex daemon 的子进程在 exec 前显式关闭 codex-tool 的 manager-lock FD；codex-tool 自身退出时也显式 unlock/close。这样后台 app-server/updater 不会再继承并长期占用 codex-tool 的 `flock`。
-
-普通 `stop` 与官方 Codex lifecycle 保持一致：只停止 managed app-server，不主动结束独立 updater loop。只有旧版 updater 本身仍是 `manager.lock` 的真实持有者时，才会针对该已验证 PID 做定向终止；`prune` / `daemon repair` 才负责拆除完整 managed runtime。如果为了释放旧锁而在 mutation 开始前提前停止了 daemon，而后续下载/API/变更失败，codex-tool 会在退出阶段尽力恢复原先运行的 daemon。
-
-## 文档
-
-- [完整使用手册](USAGE.md)
-- [版本迭代历史](CHANGELOG.md)
-- [English README](../README.md)
-- [MIT License](../LICENSE)
-
-## License
-
-MIT，详见 [LICENSE](../LICENSE)。
-
-
-## 显式停止 app-server
-
-```bash
-codex-tool stop
-# 等价别名：
-codex-tool daemon stop
-```
-
-该命令优先调用 Codex 官方的 `app-server daemon stop`。只有 daemon 状态已经 stale 且官方 stop 不能完成时，才会对路径和命令行均确认属于 managed Codex runtime 的进程进行定向清理；不会自动终止 unmanaged app-server。
-
-`stop` 在执行前不会先获取 codex-tool manager lock，这是为了让它能够处理旧版本 daemon 继承 manager-lock FD 的情况。如果检测到锁真正属于仍在运行的 codex-tool mutation，则会拒绝 stop，避免打断 update/switch 等事务。
-
-从 1.9.0 开始，install/update/switch/clean/prune 等需要改变 Codex runtime 的流程均复用统一 stop 生命周期。安装器也会在覆盖工具前检测旧 daemon 遗留的 manager lock，并在确认持有者属于 managed Codex daemon 后自动停止 daemon、释放锁，再继续安装。
+MIT，见 [LICENSE](../LICENSE)。

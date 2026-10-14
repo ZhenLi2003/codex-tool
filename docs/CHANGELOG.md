@@ -2,6 +2,16 @@
 
 This file summarizes the major iterations of `codex-tool`.
 
+## 2.1.0
+
+- Print the official Codex standalone package download URL, manual upload destination, and expected GitHub SHA-256 digest before transferring package assets for `install` or `update`.
+- Automatically detect a complete, user-owned, non-symlink `.tar.gz` package uploaded to the version-specific download cache and verify its checksum before installation.
+- Keep the existing resumable curl `.part` path when no complete local package exists; a valid manual package takes precedence over a partial transfer.
+- Continue validating the official checksum manifest and asset digest, archive safety, complete package layout, and isolated binary version for both transfer methods.
+- Preserve and reject invalid manual archives without silently deleting them or falling back to network. Continue removing corrupted automatic `.part` files.
+- Do not change manager locking, daemon handling, Optimized/Native background policies, or the existing install transaction.
+- Added offline Bash tests for local priority, checksum failure, symlink refusal, and resumable download integrity; CI runs them together with existing syntax and configuration tests.
+
 ## 2.0.0
 
 - Introduced **Optimized** and **Native** Codex background modes with reversible field-level configuration management.

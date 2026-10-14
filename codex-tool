@@ -55,7 +55,7 @@ die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 cleanup() {
   local original_rc=$?
 
-  if (( RESTORE_DAEMON_ON_EXIT )); then
+  if (( RESTORE_DAEMON_ON_EXIT )) && ! background_policy_optimized; then
     warn "restoring managed Codex app-server after an interrupted legacy-lock recovery"
     DAEMON_WAS_RUNNING=1
     daemon_restore_after_mutation || warn "unable to restore managed Codex app-server during exit cleanup"
@@ -2641,6 +2641,7 @@ clean_data() {
   local restore_daemon=0
   [[ "$DAEMON_STATE" == "running" ]] && restore_daemon=1
   (( PRELOCK_DAEMON_WAS_RUNNING )) && restore_daemon=1
+  background_policy_optimized && restore_daemon=0
 
   case "$DAEMON_STATE" in
     unmanaged-running)
@@ -2764,6 +2765,11 @@ prune_all() {
       daemon_restore_after_mutation || true
     fi
     return 1
+  fi
+
+  # Uninstalling Codex must not leave codex-tool-managed overrides in user config.
+  if background_policy_optimized; then
+    background_helper native || die "cannot restore original Codex configuration; prune aborted"
   fi
 
   if [[ -L "$CODEX_COMMAND" || ( -f "$CODEX_COMMAND" && "$force" == "1" ) ]]; then

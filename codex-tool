@@ -3218,57 +3218,70 @@ init_session_readonly() {
 main() {
   local cmd="${1:-help}"
 
-  # Fast read-only paths deliberately avoid manager layout creation, link repair,
-  # network dependency checks, and the exclusive manager lock.
   case "$cmd" in
     version|--version|-V)
       [[ $# -eq 1 ]] || die "usage: codex-tool version"
       printf 'codex-tool %s\n' "$TOOL_VERSION"
-      return 0
-      ;;
+      return 0 ;;
     help|-h|--help)
       [[ $# -eq 1 ]] || die "usage: codex-tool help"
       usage
-      return 0
-      ;;
+      return 0 ;;
     list)
       [[ $# -eq 1 ]] || die "usage: codex-tool list"
       ensure_supported_platform
       need_cmd find
       need_cmd sort
       list_versions
-      return 0
-      ;;
+      return 0 ;;
+    background)
+      [[ $# -eq 2 ]] || die "usage: codex-tool background {status|optimize|native}"
+      case "$2" in
+        status)
+          background_status ;;
+        optimize|native)
+          init_manager_mutation
+          background_command "$2" ;;
+        *) die "usage: codex-tool background {status|optimize|native}" ;;
+      esac
+      return 0 ;;
   esac
 
   case "$cmd" in
     install)
-      [[ $# -eq 2 ]] || die "usage: codex-tool install X.Y.Z"
+      [[ $# -ge 2 && $# -le 3 ]] || die "usage: codex-tool install X.Y.Z [--native]"
+      ACTIVATION_REQUEST="optimized"
+      if [[ $# -eq 3 ]]; then
+        [[ "$3" == "--native" ]] || die "unknown install option: $3"
+        ACTIVATION_REQUEST="native"
+      fi
       init_install_mutation
-      install_version "$2"
-      ;;
+      install_version "$2" ;;
     update)
-      [[ $# -eq 1 ]] || die "usage: codex-tool update"
+      [[ $# -ge 1 && $# -le 2 ]] || die "usage: codex-tool update [--native]"
+      ACTIVATION_REQUEST="optimized"
+      if [[ $# -eq 2 ]]; then
+        [[ "$2" == "--native" ]] || die "unknown update option: $2"
+        ACTIVATION_REQUEST="native"
+      fi
       init_install_mutation
       local latest
       latest="$(latest_stable_version)"
       log "latest stable Codex version: $latest"
-      install_version "$latest"
-      ;;
+      install_version "$latest" ;;
+    switch)
+      [[ $# -ge 2 && $# -le 3 ]] || die "usage: codex-tool switch X.Y.Z [--native]"
+      ACTIVATION_REQUEST="optimized"
+      if [[ $# -eq 3 ]]; then
+        [[ "$3" == "--native" ]] || die "unknown switch option: $3"
+        ACTIVATION_REQUEST="native"
+      fi
+      init_manager_mutation
+      switch_version "$2" ;;
     delete)
       [[ $# -eq 2 ]] || die "usage: codex-tool delete X.Y.Z"
       init_manager_mutation
-      delete_version "$2"
-      ;;
-    stop)
-      [[ $# -eq 1 ]] || die "usage: codex-tool stop"
-      stop_app_server_command
-      ;;
-    switch)
-      [[ $# -eq 2 ]] || die "usage: codex-tool switch X.Y.Z"
-      init_manager_mutation
-      switch_version "$2"
-      ;;
+      delete_version "$2" ;;
     clean)
       local yes=0 all_threads=0 dry_run=0
       shift
@@ -3282,8 +3295,7 @@ main() {
         shift
       done
       if (( dry_run )); then init_session_readonly; else init_manager_mutation; fi
-      clean_data "$yes" "$all_threads" "$dry_run"
-      ;;
+      clean_data "$yes" "$all_threads" "$dry_run" ;;
     prune)
       local yes=0 force=0 dry_run=0 purge_history=0
       shift
@@ -3298,61 +3310,17 @@ main() {
         shift
       done
       if (( dry_run )); then init_session_readonly; else init_manager_mutation; fi
-      prune_all "$yes" "$force" "$dry_run" "$purge_history"
-      ;;
-    daemon)
-      [[ $# -ge 2 ]] || die "usage: codex-tool daemon {status|stop|repair [--yes]}"
-      case "$2" in
-        status)
-          [[ $# -eq 2 ]] || die "usage: codex-tool daemon status"
-          ensure_supported_platform
-          need_cmd python3
-          need_cmd stat
-          daemon_status
-          ;;
-        stop)
-          [[ $# -eq 2 ]] || die "usage: codex-tool daemon stop"
-          stop_app_server_command
-          ;;
-        repair)
-          init_manager_mutation
-          local yes=0
-          shift 2
-          while (($#)); do
-            case "$1" in
-              --yes|-y) yes=1 ;;
-              *) die "unknown daemon repair option: $1" ;;
-            esac
-            shift
-          done
-          daemon_repair "$yes"
-          ;;
-        *)
-          die "usage: codex-tool daemon {status|stop|repair [--yes]}"
-          ;;
-      esac
-      ;;
+      prune_all "$yes" "$force" "$dry_run" "$purge_history" ;;
     auth)
       [[ $# -eq 2 ]] || die "usage: codex-tool auth {login|status|logout}"
       case "$2" in
-        login)
-          init_github_auth
-          auth_login
-          ;;
-        status)
-          auth_status
-          ;;
-        logout)
-          auth_logout
-          ;;
-        *)
-          die "usage: codex-tool auth {login|status|logout}"
-          ;;
-      esac
-      ;;
+        login) init_github_auth; auth_login ;;
+        status) auth_status ;;
+        logout) auth_logout ;;
+        *) die "usage: codex-tool auth {login|status|logout}" ;;
+      esac ;;
     *)
-      die "unknown command: $cmd (run 'codex-tool help')"
-      ;;
+      die "unknown command: $cmd (run 'codex-tool help')" ;;
   esac
 }
 

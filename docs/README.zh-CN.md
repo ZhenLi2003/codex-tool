@@ -106,6 +106,31 @@ Native 模式自动恢复原先的后台配置和原始二进制直连，不会�
 
 若受管理字段在优化期间被外部程序修改，工具会拒绝覆盖并报告冲突。
 
+## 手动下载与上传安装包
+
+运行 `codex-tool install X.Y.Z` 或 `codex-tool update` 时，工具会显示官方安装包下载链接、预期 SHA-256 以及服务器的完整上传路径。服务器网络很慢时，可以通过其他设备下载完整的 Codex standalone package，再上传到对应目录。
+
+例如版本 `X.Y.Z`：
+
+```text
+官方下载链接：
+https://github.com/openai/codex/releases/download/rust-vX.Y.Z/codex-package-x86_64-unknown-linux-musl.tar.gz
+
+上传目录：
+~/scripts/codex-tool/downloads/rust-vX.Y.Z/
+
+上传文件名：
+codex-package-x86_64-unknown-linux-musl.tar.gz
+```
+
+实际运行输出会给出**绝对路径**。上传完成后重新运行相同的 `install X.Y.Z` 命令即可，`update` 也支持本地包识别。如果此前下载尚未完成，可先用 Ctrl+C 中断，将完整包上传后重新执行。无需新增命令或参数。
+
+优先级：**本地完整 `.tar.gz`（SHA 校验通过）→ 已有 `.part` 断点续传 → 全新自动下载**。
+
+工具会先核对 GitHub Release 中的 SHA-256 digest 与官方校验清单，再校验上传文件的实际 SHA-256，并继续执行 tar 安全检查、完整包检查和 Codex 版本检查。上传文件必须属于当前用户且为非符号链接的普通文件。手动文件校验失败时**保留原文件并报错**，不会直接用损坏文件安装或改作断点续传；自动下载的损坏 `.part` 则沿用原有清理方式。安装成功后清理该版本下载缓存。
+
+**限制**：服务器仍需能够获取 GitHub Release 元数据和体积较小的 checksum manifest；这不是完全离线安装。手动下载固定版本后，建议使用 `codex-tool install X.Y.Z`，避免 `update` 检查到新发布的 latest 版本。
+
 ## 会话清理与卸载
 
 ```bash

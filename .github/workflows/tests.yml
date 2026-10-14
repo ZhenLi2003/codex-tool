@@ -1,0 +1,21 @@
+name: codex-tool tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bash syntax
+        run: |
+          bash -n codex-tool
+          bash -n codex-launcher
+          bash -n install.sh
+      - name: Python syntax and behavior
+        run: |
+          python3 -m py_compile background.py
+          python3 -m unittest discover -s tests -v

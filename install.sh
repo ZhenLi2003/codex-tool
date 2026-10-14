@@ -17,6 +17,8 @@ die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [[ -x "$SRC_DIR/codex-tool" ]] || die "codex-tool payload is missing"
+[[ -f "$SRC_DIR/background.py" ]] || die "background.py payload is missing"
+[[ -f "$SRC_DIR/codex-launcher" ]] || die "codex-launcher payload is missing"
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
@@ -285,6 +287,8 @@ recover_legacy_manager_locks
 
 mkdir -p "$TOOL_HOME" "$TOOL_HOME/versions" "$TOOL_HOME/downloads" "$BIN_DIR"
 install -m 0755 "$SRC_DIR/codex-tool" "$TOOL_HOME/codex-tool"
+install -m 0644 "$SRC_DIR/background.py" "$TOOL_HOME/background.py"
+install -m 0755 "$SRC_DIR/codex-launcher" "$TOOL_HOME/codex-launcher"
 [[ ! -f "$SRC_DIR/README.md" ]] || install -m 0644 "$SRC_DIR/README.md" "$TOOL_HOME/README.md"
 
 LINK="$BIN_DIR/codex-tool"
@@ -309,7 +313,13 @@ if [[ "$BIN_DIR" == "$HOME/.local/bin" ]] && ! grep -Fqs '$HOME/.local/bin' "$PR
   log "added ~/.local/bin to PATH in ~/.bashrc"
 fi
 
-restart_managed_daemon_if_needed
+if [[ -f "${CODEX_TOOL_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/codex-tool}/background/manifest.json" ]]; then
+  if (( RESTART_DAEMON_AFTER_INSTALL )); then
+    log "optimized background policy detected: leaving managed daemon stopped after legacy-lock recovery"
+  fi
+else
+  restart_managed_daemon_if_needed
+fi
 
 log "installed codex-tool to $TOOL_HOME/codex-tool"
 log "command link: $LINK"

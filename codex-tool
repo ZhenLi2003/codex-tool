@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 022
 
-TOOL_VERSION="1.9.1"
+TOOL_VERSION="2.0.0"
 TOOL_HOME="${CODEX_TOOL_HOME:-$HOME/scripts/codex-tool}"
 VERSIONS_DIR="$TOOL_HOME/versions"
 DOWNLOADS_DIR="$TOOL_HOME/downloads"
@@ -45,6 +45,8 @@ PRELOCK_ACTIVE_CAPTURE_FAILED=0
 PRELOCK_LOADED_IDS_FILE=""
 PRELOCK_LOADED_CAPTURE_FAILED=0
 RESTORE_DAEMON_ON_EXIT=0
+ACTIVATION_REQUEST="optimized"
+ACTIVATION_EFFECTIVE="native"
 
 log()  { printf '==> %s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
@@ -79,11 +81,10 @@ trap cleanup EXIT
 usage() {
   cat <<'USAGE'
 Usage:
-  codex-tool install X.Y.Z          Install/repair and activate a stable version
-  codex-tool update                 Install/activate the latest stable version
+  codex-tool install X.Y.Z [--native] Install/repair and activate a stable version
+  codex-tool update [--native]       Install/activate the latest stable version
   codex-tool delete X.Y.Z           Delete an installed non-current version
-  codex-tool stop                   Stop the managed Codex app-server daemon
-  codex-tool clean [--all] [--dry-run] [--yes]
+    codex-tool clean [--all] [--dry-run] [--yes]
                                     Delete persisted Codex sessions through the official
                                     app-server API. Default: inactive threads only.
                                     --all also interrupts/deletes background threads.
@@ -92,11 +93,10 @@ Usage:
                                     and remove Codex program/runtime assets. Inactive saved
                                     history is preserved unless --purge-history is used.
   codex-tool list                   Show current and locally installed versions only
-  codex-tool switch X.Y.Z           Safely activate an installed version with daemon
-                                    stop/restore when a managed daemon is running
-  codex-tool daemon status          Inspect managed app-server daemon state
-  codex-tool daemon stop            Alias of codex-tool stop
-  codex-tool daemon repair [--yes]  Repair stale managed daemon runtime state
+  codex-tool switch X.Y.Z [--native] Activate a version; optimized foreground by default
+  codex-tool background status      Inspect Codex background policy and processes
+  codex-tool background optimize    Back up and disable managed background runtime
+  codex-tool background native      Restore previous Codex background configuration
   codex-tool auth login             Save and verify a GitHub access token
   codex-tool auth status            Show which GitHub authentication source is active
   codex-tool auth logout            Remove the token saved by codex-tool
@@ -742,6 +742,7 @@ managed_link_or_absent() {
     if [[ -n "$actual" && -n "$expected" && "$actual" == "$expected" ]]; then return 0; fi
     # Broken links into codex-tool/current are considered manager-owned, useful after HOME migration.
     if [[ "$label" == "codex command" && "$raw" == *"/scripts/codex-tool/current/"* ]]; then return 0; fi
+    if [[ "$label" == "codex command" && "$raw" == "$TOOL_HOME/codex-launcher" ]]; then return 0; fi
     if [[ "$label" == "codex-tool command" && "$raw" == *"/scripts/codex-tool/codex-tool" ]]; then return 0; fi
   fi
   die "$label already exists and is not managed by codex-tool: $link_path"
@@ -757,6 +758,10 @@ ensure_command_links() {
     codex_path="$(version_codex_path "$cv")"
     local relative
     if [[ "$codex_path" == */bin/codex ]]; then relative="$CURRENT_LINK/bin/codex"; else relative="$CURRENT_LINK/codex"; fi
+    if background_policy_optimized; then
+      relative="$TOOL_HOME/codex-launcher"
+      [[ -x "$relative" ]] || die "optimized launcher is missing: $relative; rerun install.sh"
+    fi
     managed_link_or_absent "$CODEX_COMMAND" "$relative" "codex command"
     ln -sfn -- "$relative" "$CODEX_COMMAND"
   fi

@@ -2837,6 +2837,12 @@ prune_all() {
     confirm_or_die "$yes" "Delete all loaded/background Codex threads, stop app-server, and remove Codex program/runtime assets? Inactive saved history and user config/auth will be preserved."
   fi
 
+  # Preflight user-owned background configuration before deleting any thread
+  # or stopping the managed runtime. A conflict must not cause partial prune.
+  if background_policy_optimized; then
+    background_policy_preflight native "$yes" || return 1
+  fi
+
   make_work_dir
   local ids_file="$WORK_DIR/prune-background-threads.txt"
   : > "$ids_file"

@@ -131,6 +131,14 @@ codex-package-x86_64-unknown-linux-musl.tar.gz
 
 **限制**：服务器仍需能够获取 GitHub Release 元数据和体积较小的 checksum manifest；这不是完全离线安装。手动下载固定版本后，建议使用 `codex-tool install X.Y.Z`，避免 `update` 检查到新发布的 latest 版本。
 
+### 手动编辑配置后的状态协调（2.1.1）
+
+`codex-tool background status` 会对比当前实际配置与已保存的后台优化策略。如果用户手动修改了 `config.toml` 或 daemon 设置中的受管理字段，会显示 `Configuration: modified` 和具体偏移项，而不再仅凭 `manifest.json` 判断优化已经生效。
+
+`codex-tool background optimize` 可重新应用偏移的后台配置，且**不会覆盖首次优化前保存的 Original 备份**。`codex-tool background native` 允许字段已经被用户手动还原为原值的情况正常完成恢复；只有出现既非原始值也非已应用值的冲突时才需确认。交互式命令使用 `[y/N]` 确认；非交互环境可以先检查状态，再使用 `background optimize --yes` 或 `background native --yes`。
+
+升级兼容旧版 schema v1 备份，自动迁移到 v2，保留用户手动修改的其他模型、MCP 和配置字段。涉及版本激活和卸载的流程会在停止 daemon 或删除持久化 thread 之前检查配置冲突。
+
 ## 会话清理与卸载
 
 ```bash

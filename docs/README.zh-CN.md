@@ -90,6 +90,8 @@ Optimized 模式将 `~/.local/bin/codex` 链接到 `codex-tool` 安装的轻量 
 
 Native 模式自动恢复原先的后台配置和原始二进制直连，不会为了切换模式而主动启动 daemon。
 
+优化模式写入 `config.toml` 时，会整理工具管理的 `[features]` 表前后空行，并为 `check_for_update_on_startup`、`daemon_auto_start` 添加 `# codex-tool:` 行注释；不会重新排列其他表或删除用户注释。恢复 Native 时会移除工具添加的注释、还原字段值与原有配置。
+
 ## 备份与恢复
 
 首次优化前，工具会在以下目录保存原始配置快照与字段记录：

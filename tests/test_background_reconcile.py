@@ -158,6 +158,42 @@ class BackgroundReconciliationTests(unittest.TestCase):
         self.call("optimize")
         self.assertEqual(self.settings.read_bytes(), expected)
 
+    def test_toml_section_spacing_and_managed_comments(self):
+        self.conf.parent.mkdir(parents=True)
+        original = (
+            'model = "gpt-6"\n'
+            '\n'
+            '[features]\n'
+            'multi_agent = true\n'
+            '\n'
+            '[mcp_servers.example]\n'
+            'enabled = false\n'
+        )
+        self.conf.write_text(original, encoding="utf-8")
+        self.call("optimize")
+        optimized = self.conf.read_text()
+        self.assertEqual(optimized.count("[features]"), 1)
+        self.assertIn("\n\n[features]\n", optimized)
+        self.assertIn("\n\n[mcp_servers.example]\n", optimized)
+        self.assertEqual(optimized.count("# codex-tool: Prevent ordinary Codex sessions"), 1)
+        self.assertEqual(optimized.count("# codex-tool: Disable automatic CLI update checks"), 1)
+        self.call("optimize")
+        self.assertEqual(self.conf.read_text(), optimized)
+        self.call("native")
+        self.assertEqual(self.conf.read_text(), original)
+
+    def test_comments_follow_reconciliation_and_disappear_on_native(self):
+        self.conf.parent.mkdir(parents=True)
+        self.conf.write_text("[features]\n# user comment\ndaemon_auto_start = true # keep existing\n")
+        self.call("optimize")
+        edited = self.conf.read_text().replace("daemon_auto_start = false", "daemon_auto_start = true")
+        self.conf.write_text(edited)
+        self.call("optimize", "--yes")
+        self.assertEqual(self.conf.read_text().count("# codex-tool: Prevent ordinary Codex sessions"), 1)
+        self.call("native")
+        self.assertNotIn("# codex-tool:", self.conf.read_text())
+        self.assertIn("# user comment", self.conf.read_text())
+
     def test_original_toml_without_final_newline(self):
         self.conf.parent.mkdir(parents=True)
         self.conf.write_text('model = "gpt-6"', encoding="utf-8")

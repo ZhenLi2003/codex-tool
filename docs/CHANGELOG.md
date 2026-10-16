@@ -4,6 +4,9 @@ This file summarizes the major iterations of `codex-tool`.
 
 ## 2.1.1
 
+- Keep managed `[features]` table boundaries visually tidy with a single blank line, while preserving unrelated TOML tables and user comments.
+- Add `# codex-tool:` explanatory line comments to managed `check_for_update_on_startup` and `features.daemon_auto_start` settings when Optimized mode is applied.
+- Avoid duplicate managed comments during repeated optimization and remove only tool-owned comments when restoring Native mode.
 - Fixed background mode changes getting stuck after manually editing `CODEX_HOME/config.toml` or daemon settings.
 - Replaced manifest-exists-only detection with Original/Applied/Current reconciliation and explicit drift reporting in `background status`.
 - Reapplying `background optimize` now repairs drifted fields after confirmation, without overwriting the first original backup.

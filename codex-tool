@@ -86,7 +86,7 @@ Usage:
   codex-tool install X.Y.Z [--native] Install/repair and activate a stable version
   codex-tool update [--native]       Install/activate the latest stable version
   codex-tool delete X.Y.Z           Delete an installed non-current version
-    codex-tool clean [--all] [--dry-run] [--yes]
+  codex-tool clean [--all] [--dry-run] [--yes]
                                     Delete persisted Codex sessions through the official
                                     app-server API. Default: inactive threads only.
                                     --all also interrupts/deletes background threads.
@@ -97,8 +97,10 @@ Usage:
   codex-tool list                   Show current and locally installed versions only
   codex-tool switch X.Y.Z [--native] Activate a version; optimized foreground by default
   codex-tool background status      Inspect Codex background policy and processes
-  codex-tool background optimize    Back up and disable managed background runtime
-  codex-tool background native      Restore previous Codex background configuration
+  codex-tool background optimize [--yes]
+                                    Reapply optimized settings; confirm external edits
+  codex-tool background native [--yes]
+                                    Restore original managed fields without losing other edits
   codex-tool auth login             Save and verify a GitHub access token
   codex-tool auth status            Show which GitHub authentication source is active
   codex-tool auth logout            Remove the token saved by codex-tool

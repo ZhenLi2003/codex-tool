@@ -145,11 +145,94 @@ def modified_bool_line(line: str, value: bool) -> str:
     return f"{match.group(1)}{match.group(2)}{match.group(3)}{m.group(1)}{replacement}{m.group(3)}{match.group(5)}"
 
 
+MANAGED_COMMENTS = {
+    ROOT_KEY: "# codex-tool: Disable automatic CLI update checks; use codex-tool update.",
+    FEATURE_KEY: "# codex-tool: Prevent ordinary Codex sessions from auto-starting the shared daemon.",
+}
+
+
+def newline_for(text: str) -> str:
+    return "\r\n" if "\r\n" in text else "\n"
+
+
+def insert_managed_setting(
+    lines: list[str], scope: str, key: str, setting_line: str,
+    comment_line: str | None = None,
+) -> None:
+    """Insert a root key or an entry into an existing/new section without moving other keys."""
+    text = "".join(lines)
+    _, _, headers = toml_entries(text)
+    nl = newline_for(text)
+    prefix = [comment_line + nl] if comment_line else []
+    if not setting_line.endswith(("\n", "\r\n")):
+        setting_line += nl
+    payload = prefix + [setting_line]
+    if scope == "":
+        first_header = next((i for i, line in enumerate(lines) if HEADER.match(line.strip())), len(lines))
+        # Keep the whitespace that already separates the root and the first table
+        # after the newly inserted key, rather than introducing extra empty lines.
+        index = first_header
+        while index > 0 and not lines[index - 1].strip():
+            index -= 1
+        if index == len(lines) and lines and not lines[-1].endswith("\n"):
+            lines[-1] += nl
+        lines[index:index] = payload
+        if first_header < len(lines) - len(payload) and not lines[index + len(payload)].strip():
+            return
+        if any(HEADER.match(line.strip()) for line in lines[index + len(payload):]):
+            if index + len(payload) < len(lines) and lines[index + len(payload)].strip():
+                lines.insert(index + len(payload), nl)
+    elif scope in headers:
+        lines[headers[scope] + 1:headers[scope] + 1] = payload
+    else:
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += nl
+        if lines and lines[-1].strip():
+            lines.append(nl)
+        lines.extend([f"[{scope}]{nl}"] + payload)
+
+
+def remove_manager_comments(lines: list[str]) -> None:
+    exact = set(MANAGED_COMMENTS.values())
+    lines[:] = [line for line in lines if line.strip() not in exact]
+
+
+def tidy_managed_tables(lines: list[str]) -> None:
+    """Normalize only the touched table boundaries; leave other tables unchanged."""
+    # Work backwards so inserting or removing whitespace cannot invalidate indices.
+    for index in range(len(lines) - 1, -1, -1):
+        if not HEADER.match(lines[index].strip()):
+            continue
+        h = HEADER.match(lines[index].strip())
+        if h.group(1).strip() != "features" and (
+            not any("[features]" in row for row in lines[:index])
+        ):
+            continue
+        if index == 0:
+            continue
+        # Preserve all user comments. Collapse only whitespace immediately above
+        # a managed [features] heading or the next section heading after it.
+        if h.group(1).strip() != "features":
+            before = "".join(lines[:index])
+            if not any(HEADER.match(row.strip()) and HEADER.match(row.strip()).group(1).strip() == "features"
+                       for row in before.splitlines()):
+                continue
+        if lines[index - 1].strip():
+            lines.insert(index, newline_for("".join(lines)))
+        else:
+            j = index - 1
+            while j >= 0 and not lines[j].strip():
+                j -= 1
+            if j >= 0 and index - j > 2:
+                del lines[j + 2:index]
+
+
 def modify_toml(text: str, originals: dict | None, *, optimize: bool) -> tuple[str, dict]:
+    """Managed field reconciliation with exact original backup and annotated edits."""
     snapshot: dict = {} if originals is None else originals
     for scope, key in KEYS:
         identifier = f"{scope}.{key}" if scope else key
-        lines, entries, headers = toml_entries(text)
+        lines, entries, _ = toml_entries(text)
         positions = entries.get((scope, key), [])
         if optimize:
             if identifier not in snapshot:
@@ -158,47 +241,39 @@ def modify_toml(text: str, originals: dict | None, *, optimize: bool) -> tuple[s
                     "line": lines[positions[0]] if positions else None,
                 }
             if positions:
-                lines[positions[0]] = modified_bool_line(lines[positions[0]], False)
+                i = positions[0]
+                lines[i] = modified_bool_line(lines[i], False)
+                if i == 0 or lines[i - 1].strip() != MANAGED_COMMENTS[(scope, key)]:
+                    lines.insert(i, MANAGED_COMMENTS[(scope, key)] + newline_for(text))
             else:
-                if scope == "":
-                    first_header = next((i for i, row in enumerate(lines) if HEADER.match(row.strip())), len(lines))
-                    if first_header == len(lines) and lines and not lines[-1].endswith("\n"):
-                        lines[-1] += "\n"
-                    lines.insert(first_header, f"{key} = false\n")
-                elif scope in headers:
-                    lines.insert(headers[scope] + 1, f"{key} = false\n")
-                else:
-                    if lines and not lines[-1].endswith("\n"):
-                        lines[-1] += "\n"
-                    if lines and lines[-1].strip():
-                        lines.append("\n")
-                    lines.extend([f"[{scope}]\n", f"{key} = false\n"])
+                insert_managed_setting(
+                    lines, scope, key, f"{key} = false",
+                    MANAGED_COMMENTS[(scope, key)],
+                )
         else:
             info = snapshot.get(identifier)
             if info is None:
                 fail(f"missing original backup metadata for {identifier}")
+            # Drop only tool-owned explanatory comments, not any user's comments.
+            remove_manager_comments(lines)
+            lines, entries, _ = toml_entries("".join(lines))
+            positions = entries.get((scope, key), [])
             if info["present"]:
                 desired = right_hand_side(info["line"]) == "true"
                 if positions:
                     if (right_hand_side(lines[positions[0]]) == "true") != desired:
-                        # Restore exactly the original field line, including comments.
                         lines[positions[0]] = info["line"]
                 else:
-                    # The field was removed manually; recreate the original value.
-                    if scope == "":
-                        first_header = next((i for i, row in enumerate(lines) if HEADER.match(row.strip())), len(lines))
-                        lines.insert(first_header, info["line"])
-                    elif scope in headers:
-                        lines.insert(headers[scope] + 1, info["line"])
-                    else:
-                        if lines and not lines[-1].endswith("\n"):
-                            lines[-1] += "\n"
-                        if lines and lines[-1].strip():
-                            lines.append("\n")
-                        lines.extend([f"[{scope}]\n", info["line"]])
+                    insert_managed_setting(lines, scope, key, info["line"])
             elif positions:
                 lines.pop(positions[0])
         text = "".join(lines)
+    lines = text.splitlines(keepends=True)
+    if optimize:
+        tidy_managed_tables(lines)
+    else:
+        remove_manager_comments(lines)
+    text = "".join(lines)
     validate_toml(text)
     return text, snapshot
 

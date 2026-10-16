@@ -1,4 +1,4 @@
-# codex-tool 2.1.0 — Usage Guide
+# codex-tool 2.1.1 — Usage Guide
 
 Standalone Codex CLI version management for Linux x86_64, without root or npm.
 
@@ -136,6 +136,24 @@ ${CODEX_TOOL_CONFIG_DIR:-~/.config/codex-tool}/background/
 Private backup permissions are 0700 on directories and 0600 on files. Restoration is field-specific and leaves unrelated user edits intact. If another application changes a managed value during optimization, restoration fails instead of overwriting it without warning. Complex inline TOML feature tables are rejected conservatively rather than incorrectly rewritten.
 
 Run `codex-tool background native` to revert before manually editing managed fields, or resolve a reported conflict explicitly.
+
+### Configuration reconciliation after manual edits
+
+The helper records Original (before the first optimization), Applied (the last managed policy), and Current (the actual TOML/JSON files). A schema-v1 manifest is supported and is migrated to schema-v2 the next time optimization is committed; the original backup files are **never replaced** by a later optimize.
+
+```bash
+codex-tool background status
+codex-tool background optimize
+codex-tool background optimize --yes
+codex-tool background native
+codex-tool background native --yes
+```
+
+`background status` distinguishes the saved mode from the actual configuration (`optimized` or `modified`) and shows the changed managed keys. Unmanaged settings do not count as drift.
+
+Reapplying optimization after manual changes requires `[y/N]` confirmation; in noninteractive scripts, `--yes` explicitly authorizes overwriting managed keys. Restoring Native requires no confirmation when each managed key is either in its previously Applied state or already manually returned to its Original state. Third-state edits require explicit approval. Original values, including absence of a key, are restored per field; other TOML/JSON settings are left intact.
+
+Config checks happen **before** the managed app-server is stopped for version activation and before persisted sessions are removed during prune. Invalid or unsupported TOML is rejected before writing, and configuration files are checked again for concurrent external edits.
 
 ## Clean: persisted session cleanup
 

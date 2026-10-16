@@ -112,6 +112,14 @@ Priority is: **verified complete local `.tar.gz` → resumable curl `.tar.gz.par
 
 A corrupt manually uploaded package is **preserved and rejected**, without falling back to another download. A corrupt automatic `.part` file is removed as before. Successful installation removes that version's download cache. The server still needs GitHub release metadata and the small checksum manifest; this is **not** a fully offline installer. For a pinned manually downloaded version, use `install X.Y.Z` rather than `update`, since the latest version can change.
 
+### Manual configuration edits and reconciliation (2.1.1)
+
+`background status` compares the currently loaded configuration with the saved Optimized policy. If you manually edit `config.toml` or managed daemon settings while optimization is active, status displays `Configuration: modified` and the keys that have drifted; it does not mistake the presence of `manifest.json` for successful optimization.
+
+`background optimize` rechecks and can reapply drifted managed fields, retaining the first original backup. `background native` safely recognizes fields you already manually restored to their original values. Unexpected third-state edits require confirmation rather than permanently blocking restoration; for noninteractive operation, use `background optimize --yes` or `background native --yes` after reviewing the drift. Unrelated user changes, such as model/MCP settings, are preserved.
+
+Legacy schema-v1 backup manifests are read and migrated to v2 without overwriting the original backups. Version activations and destructive prune operations preflight this reconciliation before stopping daemon or deleting sessions.
+
 ## Session and runtime cleanup
 
 ```bash

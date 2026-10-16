@@ -80,13 +80,15 @@ class BackgroundPolicyTests(unittest.TestCase):
         self.assertEqual(data["updater"]["updateIntervalMinutes"], 30)
         self.assertEqual(data["shutdownGraceSeconds"], 30)
 
-    def test_detects_managed_conflict_and_keeps_backup(self):
+    def test_manually_restored_native_value_is_accepted(self):
+        self.config.parent.mkdir(parents=True)
+        self.config.write_text("[features]\ndaemon_auto_start = true\n")
         self.run_helper("optimize")
         self.config.write_text(self.config.read_text().replace(
             "daemon_auto_start = false", "daemon_auto_start = true"))
-        res = self.run_helper("native", success=False)
-        self.assertIn("changed externally", res.stderr)
-        self.assertTrue((self.state / "background" / "manifest.json").exists())
+        self.run_helper("native")
+        self.assertFalse((self.state / "background" / "manifest.json").exists())
+        self.assertIn("daemon_auto_start = true", self.config.read_text())
 
     def test_duplicate_toml_rejected_without_edit(self):
         self.config.parent.mkdir(parents=True)

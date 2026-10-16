@@ -2,6 +2,18 @@
 
 This file summarizes the major iterations of `codex-tool`.
 
+## 2.1.1
+
+- Fixed background mode changes getting stuck after manually editing `CODEX_HOME/config.toml` or daemon settings.
+- Replaced manifest-exists-only detection with Original/Applied/Current reconciliation and explicit drift reporting in `background status`.
+- Reapplying `background optimize` now repairs drifted fields after confirmation, without overwriting the first original backup.
+- `background native` accepts fields already manually restored to their original value, including originally absent entries. Genuine third-state conflicts require explicit approval.
+- Added `background optimize --yes` and `background native --yes` for noninteractive, explicitly approved conflict resolution.
+- Introduced a backward-compatible schema-v2 manifest; schema-v1 manifests migrate without replacing protected backups.
+- Added full TOML syntax validation when Python's `tomllib` is available and improved boolean edits to preserve inline comments.
+- Preflight configuration conflicts before daemon lifecycle changes and before destructive prune session cleanup.
+- Avoid reformatting daemon settings JSON on an idempotent background optimize; added reconciliation and migration regression tests.
+
 ## 2.1.0
 
 - Print the official Codex standalone package download URL, manual upload destination, and expected GitHub SHA-256 digest before transferring package assets for `install` or `update`.

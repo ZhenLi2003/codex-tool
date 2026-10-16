@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 022
 
-TOOL_VERSION="2.1.0"
+TOOL_VERSION="2.1.1"
 TOOL_HOME="${CODEX_TOOL_HOME:-$HOME/scripts/codex-tool}"
 VERSIONS_DIR="$TOOL_HOME/versions"
 DOWNLOADS_DIR="$TOOL_HOME/downloads"
@@ -47,6 +47,8 @@ PRELOCK_LOADED_CAPTURE_FAILED=0
 RESTORE_DAEMON_ON_EXIT=0
 ACTIVATION_REQUEST="optimized"
 ACTIVATION_EFFECTIVE="native"
+BACKGROUND_PREFLIGHT_CHOICE=""
+BACKGROUND_POLICY_OVERRIDE=0
 
 log()  { printf '==> %s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
@@ -756,22 +758,62 @@ background_helper() {
   need_cmd python3
   local helper="$TOOL_HOME/background.py"
   [[ -f "$helper" ]] || die "background policy helper missing: $helper; rerun ./install.sh"
-  python3 "$helper" "$1" --codex-home "$CODEX_DATA_DIR" --config-dir "$CONFIG_DIR"
+  local action="$1"
+  shift
+  python3 "$helper" "$action" --codex-home "$CODEX_DATA_DIR" --config-dir "$CONFIG_DIR" "$@"
+}
+
+background_policy_preflight() {
+  local choice="$1" yes="${2:-0}" report=""
+  [[ "$choice" == "optimized" || "$choice" == "native" ]] || die "unsupported background mode: $choice"
+  [[ "$BACKGROUND_PREFLIGHT_CHOICE" != "$choice" ]] || return 0
+
+  local action="optimize"
+  [[ "$choice" != "native" ]] || action="native"
+  report="$(background_helper check --target "$action")" || return 1
+
+  if python3 -c 'import json,sys;sys.exit(0 if json.loads(sys.argv[1])["confirmation_required"] else 1)' "$report"; then
+    warn "manually modified Codex background settings were detected:"
+    python3 - "$report" <<'PY' >&2
+import json,sys
+for item in json.loads(sys.argv[1])["changes"]:
+    current=item["current"]
+    target=item["target"]
+    def fmt(value):
+        if not value["present"]:
+            return "<absent>"
+        return str(value["value"]).lower() if isinstance(value["value"],bool) else str(value["value"])
+    print(f"  {item['key']}: current={fmt(current)}, target={fmt(target)}")
+PY
+    if [[ "$yes" != "1" ]]; then
+      if [[ ! -t 0 || ! -t 2 ]]; then
+        warn "configuration reconciliation needs confirmation; rerun interactively or use 'codex-tool background $action --yes'"
+        return 1
+      fi
+      local answer=""
+      printf 'Restore requested %s background settings? [y/N] ' "$choice" >&2
+      read -r answer || answer=""
+      case "$answer" in
+        y|Y|yes|YES) ;;
+        *) warn "background configuration reconciliation cancelled"; return 1 ;;
+      esac
+    fi
+    BACKGROUND_POLICY_OVERRIDE=1
+  else
+    BACKGROUND_POLICY_OVERRIDE=0
+  fi
+  BACKGROUND_PREFLIGHT_CHOICE="$choice"
 }
 
 background_apply_policy() {
-  local choice="$1"
-  case "$choice" in
-    optimized)
-      background_helper optimize || return 1
-      ;;
-    native)
-      background_helper native || return 1
-      ;;
-    *)
-      die "internal error: unsupported background mode $choice"
-      ;;
-  esac
+  local choice="$1" action="optimize"
+  [[ "$choice" != "native" ]] || action="native"
+  background_policy_preflight "$choice" || return 1
+  local args=()
+  (( BACKGROUND_POLICY_OVERRIDE )) && args+=(--yes)
+  background_helper "$action" "${args[@]}" || return 1
+  BACKGROUND_PREFLIGHT_CHOICE=""
+  BACKGROUND_POLICY_OVERRIDE=0
   ensure_command_links
 }
 
@@ -823,6 +865,9 @@ background_choose_activation() {
 background_prepare_activation() {
   local version="$1" staged_binary="${2:-}"
   background_choose_activation "$version" "$staged_binary"
+
+  # Detect drift before stopping the daemon or changing the version.
+  background_policy_preflight "$ACTIVATION_EFFECTIVE" || return 1
 
   # Lifecycle boundaries remain mandatory for both modes.
   daemon_stop_for_mutation || return 1

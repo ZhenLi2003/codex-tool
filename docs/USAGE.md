@@ -90,6 +90,8 @@ A corrupt manual archive is preserved and rejected, **without** automatic fallba
 
 You can use `Ctrl+C` to stop a slow large transfer, upload the complete archive, and rerun the command. No watcher or new persistent background process is needed.
 
+Managed TOML edits keep `[features]` section boundaries readable and annotate the two managed keys with `# codex-tool:` comments. Reapplying optimization will not duplicate annotations; Native restoration removes only tool-owned annotations while leaving user comments intact.
+
 ## Background policy
 
 ```bash

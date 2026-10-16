@@ -162,6 +162,8 @@ def modify_toml(text: str, originals: dict | None, *, optimize: bool) -> tuple[s
             else:
                 if scope == "":
                     first_header = next((i for i, row in enumerate(lines) if HEADER.match(row.strip())), len(lines))
+                    if first_header == len(lines) and lines and not lines[-1].endswith("\n"):
+                        lines[-1] += "\n"
                     lines.insert(first_header, f"{key} = false\n")
                 elif scope in headers:
                     lines.insert(headers[scope] + 1, f"{key} = false\n")

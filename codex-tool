@@ -901,11 +901,20 @@ background_status() {
   local description
   description="$(background_helper status)" || return 1
   python3 - "$description" <<'PY'
-import json, sys
+import json,sys
 state=json.loads(sys.argv[1])
 print("Background policy:  " + state["mode"])
+print("Configuration:      " + state["effective"])
+if state["manifest_schema"]:
+    print("Manifest schema:    " + str(state["manifest_schema"]))
 for k,v in state["configuration"].items():
     print(f"  {k}: {str(v).lower() if isinstance(v,bool) else v}")
+for item in state.get("drift",[]):
+    value=item["current"]
+    target=item["target"]
+    current="<absent>" if not value["present"] else str(value["value"]).lower()
+    expected="<absent>" if not target["present"] else str(target["value"]).lower()
+    print(f"  DRIFT {item['key']}: current={current}, optimized={expected}")
 PY
   daemon_snapshot
   printf 'Managed app-server: %s\n' "$DAEMON_STATE"
@@ -919,14 +928,25 @@ PY
   else
     printf 'Managed runtime PIDs: none\n'
   fi
+  local expected_link="" actual_link=""
+  if background_policy_optimized; then
+    expected_link="$TOOL_HOME/codex-launcher"
+  else
+    expected_link="$CURRENT_LINK/bin/codex"
+  fi
+  actual_link="$(readlink "$CODEX_COMMAND" 2>/dev/null || true)"
+  if [[ -n "$actual_link" && "$actual_link" != "$expected_link" ]]; then
+    warn "codex launcher link differs from current background policy: $actual_link"
+  fi
   return 0
 }
 
 background_command() {
-  local action="$1"
+  local action="$1" yes="${2:-0}"
   case "$action" in
     status) background_status ;;
     optimize)
+      background_policy_preflight optimized "$yes" || return 1
       background_choose_activation "$(current_version 2>/dev/null || true)"
       # Explicit background optimize should not silently switch to native.
       [[ "$ACTIVATION_EFFECTIVE" == "optimized" ]] || { warn "optimization cancelled"; return 1; }
@@ -939,7 +959,8 @@ background_command() {
       log "Codex managed background runtime disabled"
       ;;
     native)
-      background_apply_policy native
+      background_policy_preflight native "$yes" || return 1
+      background_apply_policy native || return 1
       log "Codex original background configuration restored; daemon was not started"
       ;;
     *) die "usage: codex-tool background {status|optimize|native}" ;;
@@ -2870,7 +2891,8 @@ prune_all() {
 
   # Uninstalling Codex must not leave codex-tool-managed overrides in user config.
   if background_policy_optimized; then
-    background_helper native || die "cannot restore original Codex configuration; prune aborted"
+    background_policy_preflight native "$yes" || die "cannot reconcile original Codex configuration; prune aborted"
+    background_apply_policy native || die "cannot restore original Codex configuration; prune aborted"
   fi
 
   if [[ -L "$CODEX_COMMAND" || ( -f "$CODEX_COMMAND" && "$force" == "1" ) ]]; then
@@ -3342,14 +3364,20 @@ main() {
       list_versions
       return 0 ;;
     background)
-      [[ $# -eq 2 ]] || die "usage: codex-tool background {status|optimize|native}"
+      [[ $# -ge 2 && $# -le 3 ]] || die "usage: codex-tool background {status|optimize|native} [--yes]"
+      local background_yes=0
+      if [[ $# -eq 3 ]]; then
+        [[ "$3" == "--yes" || "$3" == "-y" ]] || die "unknown background option: $3"
+        background_yes=1
+      fi
       case "$2" in
         status)
+          (( background_yes == 0 )) || die "background status does not accept --yes"
           background_status ;;
         optimize|native)
           init_manager_mutation
-          background_command "$2" ;;
-        *) die "usage: codex-tool background {status|optimize|native}" ;;
+          background_command "$2" "$background_yes" ;;
+        *) die "usage: codex-tool background {status|optimize|native} [--yes]" ;;
       esac
       return 0 ;;
   esac

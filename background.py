@@ -198,33 +198,46 @@ def remove_manager_comments(lines: list[str]) -> None:
 
 
 def tidy_managed_tables(lines: list[str]) -> None:
-    """Normalize only the touched table boundaries; leave other tables unchanged."""
-    # Work backwards so inserting or removing whitespace cannot invalidate indices.
-    for index in range(len(lines) - 1, -1, -1):
-        if not HEADER.match(lines[index].strip()):
-            continue
-        h = HEADER.match(lines[index].strip())
-        if h.group(1).strip() != "features" and (
-            not any("[features]" in row for row in lines[:index])
-        ):
-            continue
-        if index == 0:
-            continue
-        # Preserve all user comments. Collapse only whitespace immediately above
-        # a managed [features] heading or the next section heading after it.
-        if h.group(1).strip() != "features":
-            before = "".join(lines[:index])
-            if not any(HEADER.match(row.strip()) and HEADER.match(row.strip()).group(1).strip() == "features"
-                       for row in before.splitlines()):
-                continue
-        if lines[index - 1].strip():
-            lines.insert(index, newline_for("".join(lines)))
-        else:
-            j = index - 1
-            while j >= 0 and not lines[j].strip():
-                j -= 1
-            if j >= 0 and index - j > 2:
-                del lines[j + 2:index]
+    """Ensure a single empty line at [features] section boundaries only."""
+    text = "".join(lines)
+    nl = newline_for(text)
+    section_indices = [
+        (i, HEADER.match(row.strip()).group(1).strip())
+        for i, row in enumerate(lines) if HEADER.match(row.strip())
+    ]
+    features = next((i for i, name in section_indices if name == "features"), None)
+    if features is None:
+        return
+
+    # Separator before [features]: do not move unrelated keys or user comments.
+    if features > 0:
+        start = features
+        while start > 0 and not lines[start - 1].strip():
+            start -= 1
+        if start == features:
+            lines.insert(features, nl)
+            features += 1
+        elif start > 0 and features - start != 1:
+            del lines[start + 1:features]
+            features = start + 1
+
+    # Separator after the [features] table, before the next TOML table.
+    following = next(
+        (i for i in range(features + 1, len(lines)) if HEADER.match(lines[i].strip())),
+        None,
+    )
+    if following is None or following == 0:
+        return
+    start = following
+    while start > 0 and not lines[start - 1].strip():
+        start -= 1
+    if start == following:
+        # If a user comment is directly before the next heading, do not detach
+        # that comment; Codex-owned formatting is restricted to the features table.
+        if not lines[following - 1].lstrip().startswith("#"):
+            lines.insert(following, nl)
+    elif start > 0 and following - start != 1:
+        del lines[start + 1:following]
 
 
 def modify_toml(text: str, originals: dict | None, *, optimize: bool) -> tuple[str, dict]:

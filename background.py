@@ -233,21 +233,26 @@ def modify_settings(text: str, originals: dict | None, *, optimize: bool) -> tup
     if not isinstance(value, dict):
         fail("daemon settings JSON root must be an object")
     snapshot: dict = {} if originals is None else originals
+    changed = False
     for path in SETTINGS_FIELDS:
         name = ".".join(path)
         present, old = get_nested(value, path)
         if optimize:
             if name not in snapshot:
                 snapshot[name] = {"present": present, "value": old}
-            set_nested(value, path, False)
+            if not present or old is not False:
+                set_nested(value, path, False)
+                changed = True
         else:
             meta = snapshot.get(name)
             if meta is None:
-                fail(f"missing backup metadata for {name}")
-            current_present, current = get_nested(value, path)
-            if not current_present or current is not False:
-                fail(f"managed JSON setting was changed externally: {name}")
-            set_nested(value, path, meta["value"], bool(meta["present"]))
+                fail(f"missing original backup metadata for {name}")
+            target_present, target_value = bool(meta["present"]), meta["value"]
+            if present != target_present or (present and old != target_value):
+                set_nested(value, path, target_value, target_present)
+                changed = True
+    if not changed:
+        return text, snapshot
     return json.dumps(value, ensure_ascii=False, indent=2) + "\n", snapshot
 
 

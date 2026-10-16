@@ -158,6 +158,14 @@ class BackgroundReconciliationTests(unittest.TestCase):
         self.call("optimize")
         self.assertEqual(self.settings.read_bytes(), expected)
 
+    def test_original_toml_without_final_newline(self):
+        self.conf.parent.mkdir(parents=True)
+        self.conf.write_text('model = "gpt-6"', encoding="utf-8")
+        self.call("optimize")
+        self.assertEqual(self.state()["effective"], "optimized")
+        self.call("native")
+        self.assertEqual(self.conf.read_text(), 'model = "gpt-6"')
+
     def test_native_of_original_false_is_idempotent(self):
         self.conf.parent.mkdir(parents=True)
         self.conf.write_text('[features]\ndaemon_auto_start = false\n')

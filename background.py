@@ -309,7 +309,8 @@ def read_manifest(path: Path) -> dict | None:
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict) or value.get("schema") not in (1, 2):
         fail("invalid or unsupported background manifest schema")
-    originals = original_snapshots(value)
+    original_toml, original_json = original_snapshots(value)
+    originals = {"toml": original_toml, "json": original_json}
     expected = managed_applied()
     for group in ("toml", "json"):
         if set(originals[group]) != set(expected[group]):

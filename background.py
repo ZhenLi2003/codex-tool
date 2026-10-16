@@ -259,70 +259,217 @@ def paths(args: argparse.Namespace) -> tuple[Path, Path, Path]:
     )
 
 
-def status(args: argparse.Namespace) -> int:
+def settings_snapshot(text: str) -> dict:
+    mapping = json.loads(text) if text.strip() else {}
+    if not isinstance(mapping, dict):
+        fail("daemon settings JSON root must be an object")
+    result = {}
+    for path in SETTINGS_FIELDS:
+        present, value = get_nested(mapping, path)
+        result[".".join(path)] = {"present": present, "value": value if present else None}
+    return result
+
+
+def original_snapshots(manifest: dict) -> tuple[dict, dict]:
+    toml_originals = {}
+    for name, info in manifest["toml_originals"].items():
+        toml_originals[name] = {
+            "present": info["present"],
+            "value": right_hand_side(info["line"]) == "true" if info["present"] else None,
+        }
+    json_originals = {}
+    for name, info in manifest["json_originals"].items():
+        json_originals[name] = {
+            "present": info["present"],
+            "value": info["value"] if info["present"] else None,
+        }
+    return toml_originals, json_originals
+
+
+def managed_applied() -> dict:
+    keys = {f"{scope}.{key}" if scope else key: {"present": True, "value": False}
+            for scope, key in KEYS}
+    settings = {".".join(path): {"present": True, "value": False}
+                for path in SETTINGS_FIELDS}
+    return {"toml": keys, "json": settings}
+
+
+def read_manifest(path: Path) -> dict | None:
+    if path.is_symlink():
+        fail(f"refusing symlink manifest: {path}")
+    if not path.exists():
+        return None
+    if not path.is_file() or path.stat().st_uid != os.getuid():
+        fail(f"unsafe background manifest: {path}")
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict) or value.get("schema") not in (1, 2):
+        fail("invalid or unsupported background manifest schema")
+    originals = original_snapshots(value)
+    expected = managed_applied()
+    for group in ("toml", "json"):
+        if set(originals[group]) != set(expected[group]):
+            fail(f"background manifest missing managed keys in {group}")
+    if value["schema"] == 2 and value.get("applied") != expected:
+        fail("background manifest has unsupported applied settings")
+    return value
+
+
+def observed_state(config_text: str, settings_text: str) -> dict:
+    return {"toml": toml_snapshot(config_text), "json": settings_snapshot(settings_text)}
+
+
+def compare_state(current: dict, desired: dict, original: dict | None) -> list[dict]:
+    rows = []
+    for group in ("toml", "json"):
+        for name, target in desired[group].items():
+            actual = current[group][name]
+            if actual == target:
+                continue
+            initial = original[group][name] if original else None
+            rows.append({
+                "file": "config.toml" if group == "toml" else "app-server-daemon/settings.json",
+                "key": name,
+                "current": actual,
+                "target": target,
+                "original": initial,
+                "classification": (
+                    "original-already-restored" if original and actual == initial
+                    else "external-conflict"
+                ),
+            })
+    return rows
+
+
+def report(args: argparse.Namespace) -> dict:
     conf, settings, policy = paths(args)
-    manifest = policy / "manifest.json"
-    state = "optimized" if manifest.exists() else "native"
+    manifest = read_manifest(policy / "manifest.json")
     _, config_text, _ = load_text(conf)
     _, settings_text, _ = load_text(settings)
-    _, entries, _ = toml_entries(config_text)
-    values = {}
-    for key in KEYS:
-        places = entries.get(key, [])
-        name = f"{key[0]}.{key[1]}" if key[0] else key[1]
-        values[name] = right_hand_side(config_text.splitlines(keepends=True)[places[0]]) if places else "unset"
-    mapping = json.loads(settings_text) if settings_text.strip() else {}
-    for path in SETTINGS_FIELDS:
-        present, val = get_nested(mapping, path)
-        values[".".join(path)] = val if present else "unset"
-    print(json.dumps({"mode": state, "configuration": values}, ensure_ascii=False))
+    current = observed_state(config_text, settings_text)
+    applied = managed_applied()
+    original = None
+    if manifest:
+        t, j = original_snapshots(manifest)
+        original = {"toml": t, "json": j}
+
+    if args.action == "status":
+        drift = compare_state(current, applied, original) if manifest else []
+        values = {**{k: (v["value"] if v["present"] else "unset") for k,v in current["toml"].items()},
+                  **{k: (v["value"] if v["present"] else "unset") for k,v in current["json"].items()}}
+        return {
+            "mode": "optimized" if manifest else "native",
+            "effective": ("modified" if drift else "optimized") if manifest else "native",
+            "configuration": values,
+            "drift": drift,
+            "manifest_schema": manifest.get("schema") if manifest else None,
+        }
+
+    target = args.target if args.action == "check" else args.action
+    if target not in ("optimize", "native"):
+        fail(f"invalid background target: {target}")
+
+    if target == "optimize":
+        differences = compare_state(current, applied, original) if manifest else []
+        needs_confirmation = bool(differences)
+    else:
+        differences = compare_state(current, original, original) if original else []
+        # A current value equal to Applied or Original is always safe to restore.
+        needs_confirmation = any(
+            row["current"] != applied[
+                "toml" if row["file"] == "config.toml" else "json"
+            ][row["key"]]
+            for row in differences
+        )
+    return {
+        "target": target,
+        "mode": "optimized" if manifest else "native",
+        "changes": differences,
+        "confirmation_required": needs_confirmation,
+        "manifest_schema": manifest.get("schema") if manifest else None,
+    }
+
+
+def status(args: argparse.Namespace) -> int:
+    print(json.dumps(report(args), ensure_ascii=False, sort_keys=True))
     return 0
+
+
+def stage_manifest_upgrade(manifest: dict) -> dict:
+    if manifest.get("schema") == 2:
+        return manifest
+    upgraded = dict(manifest)
+    upgraded["schema"] = 2
+    upgraded["mode"] = "optimized"
+    upgraded["applied"] = managed_applied()
+    return upgraded
+
+
+def unchanged(path: Path, initial: tuple[bool, str, int]) -> bool:
+    existed, content, mode = load_text(path)
+    return (existed, content, mode) == initial
 
 
 def apply(args: argparse.Namespace, optimize: bool) -> int:
     conf, settings, policy = paths(args)
     manifest_path = policy / "manifest.json"
-    if optimize and manifest_path.exists():
-        print("Background optimization is already configured.")
-        return 0
-    if not optimize and not manifest_path.exists():
+    existing = read_manifest(manifest_path)
+    if not optimize and existing is None:
         print("Native mode is already configured.")
         return 0
 
-    config_existed, old_config, config_mode = load_text(conf)
-    settings_existed, old_settings, settings_mode = load_text(settings)
+    config_initial = load_text(conf)
+    settings_initial = load_text(settings)
+    config_existed, old_config, config_mode = config_initial
+    settings_existed, old_settings, settings_mode = settings_initial
+    current = observed_state(old_config, old_settings)
+    applied = managed_applied()
+    originals = None
+    if existing:
+        orig_t, orig_j = original_snapshots(existing)
+        originals = {"toml": orig_t, "json": orig_j}
+
+    target = applied if optimize else originals
+    changes = compare_state(current, target, originals) if target else []
+    if optimize:
+        confirmation_required = bool(changes) and existing is not None
+    else:
+        confirmation_required = any(
+            row["current"] != applied["toml" if row["file"] == "config.toml" else "json"][row["key"]]
+            for row in changes
+        )
+    if confirmation_required and not args.yes:
+        keys = ", ".join(row["key"] for row in changes)
+        fail(f"managed fields were modified externally: {keys}; confirm with --yes after reviewing 'background status'")
 
     if optimize:
-        new_config, toml_originals = modify_toml(old_config, None, optimize=True)
-        new_settings, json_originals = modify_settings(old_settings, None, optimize=True)
-        _, original_entries, original_headers = toml_entries(old_config)
-        manifest = {
-            "schema": 1,
-            "features_header_existed": "features" in original_headers,
-            "config_existed": config_existed,
-            "settings_existed": settings_existed,
-            "config_mode": config_mode,
-            "settings_mode": settings_mode,
-            "toml_originals": toml_originals,
-            "json_originals": json_originals,
-        }
-        private_dir(policy)
-        backup = policy / "backup"
-        private_dir(backup)
-        atomic_write(backup / "config.toml", old_config, 0o600)
-        atomic_write(backup / "daemon-settings.json", old_settings, 0o600)
+        new_config, toml_originals = modify_toml(
+            old_config, existing["toml_originals"] if existing else None, optimize=True
+        )
+        new_settings, json_originals = modify_settings(
+            old_settings, existing["json_originals"] if existing else None, optimize=True
+        )
+        if existing:
+            manifest = stage_manifest_upgrade(existing)
+        else:
+            _, _, original_headers = toml_entries(old_config)
+            manifest = {
+                "schema": 2,
+                "mode": "optimized",
+                "applied": applied,
+                "features_header_existed": "features" in original_headers,
+                "config_existed": config_existed,
+                "settings_existed": settings_existed,
+                "config_mode": config_mode,
+                "settings_mode": settings_mode,
+                "toml_originals": toml_originals,
+                "json_originals": json_originals,
+            }
     else:
-        if manifest_path.is_symlink():
-            fail("refusing symlink policy manifest")
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if manifest.get("schema") != 1:
-            fail("unsupported background manifest schema")
+        manifest = existing
         new_config, _ = modify_toml(old_config, manifest["toml_originals"], optimize=False)
         new_settings, _ = modify_settings(old_settings, manifest["json_originals"], optimize=False)
 
         if not manifest.get("features_header_existed", True):
-            # The manager may have introduced an otherwise empty [features] table.
-            # Remove only a wholly empty table; preserve comments and new user keys.
             lines = new_config.splitlines(keepends=True)
             for index, line in enumerate(lines):
                 if not re.match(r"^\s*\[features\]\s*$", line.strip()):
@@ -334,26 +481,45 @@ def apply(args: argparse.Namespace, optimize: bool) -> int:
                 break
             new_config = "".join(lines)
 
-        # If the result has exactly the original logical lines, keep byte-for-byte
-        # formatting from the protected initial backup.
         backup_config = policy / "backup" / "config.toml"
-        if backup_config.exists():
-            backed_up = backup_config.read_bytes().decode("utf-8")
+        if backup_config.is_file() and not backup_config.is_symlink():
+            backed_up = backup_config.read_text(encoding="utf-8")
             if new_config.strip() == backed_up.strip():
                 new_config = backed_up
 
-    # Validate both changes before writing either file.
-    original1 = (config_existed, old_config, config_mode)
-    original2 = (settings_existed, old_settings, settings_mode)
+    # Fail before any write if another process edited either file since reading it.
+    if not unchanged(conf, config_initial) or not unchanged(settings, settings_initial):
+        fail("Codex configuration changed during background reconciliation; retry")
+
+    # A no-op repeated optimize retains the original backups, even with unrelated edits.
+    if (optimize and existing and new_config == old_config and new_settings == old_settings
+            and existing.get("schema") == 2):
+        print("Background optimization verified; no changes required.")
+        return 0
+
     try:
-        if not optimize and not manifest["config_existed"] and not new_config.strip():
-            conf.unlink(missing_ok=True)
+        if optimize and existing is None:
+            private_dir(policy)
+            backup = policy / "backup"
+            private_dir(backup)
+            atomic_write(backup / "config.toml", old_config, 0o600)
+            atomic_write(backup / "daemon-settings.json", old_settings, 0o600)
         else:
-            atomic_write(conf, new_config, config_mode)
-        if not optimize and not manifest["settings_existed"] and json.loads(new_settings) == {}:
-            settings.unlink(missing_ok=True)
-        else:
-            atomic_write(settings, new_settings, settings_mode)
+            # Never rewrite the protected first-optimization backups.
+            pass
+
+        if new_config != old_config:
+            if not optimize and not manifest["config_existed"] and not new_config.strip():
+                conf.unlink(missing_ok=True)
+            else:
+                atomic_write(conf, new_config, config_mode)
+        if not unchanged(settings, settings_initial):
+            fail("daemon settings changed while applying config.toml; retry")
+        if new_settings != old_settings:
+            if not optimize and not manifest["settings_existed"] and json.loads(new_settings) == {}:
+                settings.unlink(missing_ok=True)
+            else:
+                atomic_write(settings, new_settings, settings_mode)
         if optimize:
             atomic_write(manifest_path, json.dumps(manifest, indent=2) + "\n", 0o600)
         else:
@@ -361,11 +527,17 @@ def apply(args: argparse.Namespace, optimize: bool) -> int:
             for name in ("config.toml", "daemon-settings.json"):
                 (policy / "backup" / name).unlink(missing_ok=True)
     except Exception:
-        for path, (existed, content, mode) in ((conf, original1), (settings, original2)):
-            if existed:
-                atomic_write(path, content, mode)
+        # Roll back only the fields this transaction wrote. Do not discard backups.
+        if not unchanged(conf, config_initial):
+            if config_existed:
+                atomic_write(conf, old_config, config_mode)
             else:
-                path.unlink(missing_ok=True)
+                conf.unlink(missing_ok=True)
+        if not unchanged(settings, settings_initial):
+            if settings_existed:
+                atomic_write(settings, old_settings, settings_mode)
+            else:
+                settings.unlink(missing_ok=True)
         raise
 
     print("Applied background optimization." if optimize else "Restored native background configuration.")
@@ -374,15 +546,19 @@ def apply(args: argparse.Namespace, optimize: bool) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=["status", "optimize", "native"])
+    parser.add_argument("action", choices=["status", "optimize", "native", "check"])
+    parser.add_argument("--target", choices=["optimize", "native"])
+    parser.add_argument("--yes", action="store_true", help="explicitly resolve managed-key conflicts")
     parser.add_argument("--codex-home", required=True)
     parser.add_argument("--config-dir", required=True)
     args = parser.parse_args()
     try:
-        if args.action == "status":
+        if args.action in ("status", "check"):
+            if args.action == "check" and not args.target:
+                fail("check requires --target optimize|native")
             return status(args)
         return apply(args, optimize=args.action == "optimize")
-    except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
         print(f"background policy error: {exc}", file=sys.stderr)
         return 1
 

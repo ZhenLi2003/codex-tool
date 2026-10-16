@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
-import shutil
 import stat
 import sys
 import tempfile
+
+try:
+    import tomllib  # Python 3.11+; validate the full document before edits
+except ImportError:
+    tomllib = None
 
 ROOT_KEY = ("", "check_for_update_on_startup")
 FEATURE_KEY = ("features", "daemon_auto_start")
@@ -65,7 +70,16 @@ def atomic_write(path: Path, content: str, mode: int = 0o600) -> None:
             os.unlink(tmp)
 
 
+def validate_toml(text: str) -> None:
+    if tomllib is not None and text.strip():
+        try:
+            tomllib.loads(text)
+        except tomllib.TOMLDecodeError as exc:
+            fail(f"invalid Codex config.toml: {exc}")
+
+
 def toml_entries(text: str) -> tuple[list[str], dict[tuple[str, str], list[int]], dict[str, int]]:
+    validate_toml(text)
     lines = text.splitlines(keepends=True)
     scope = ""
     entries: dict[tuple[str, str], list[int]] = {}
@@ -74,6 +88,8 @@ def toml_entries(text: str) -> tuple[list[str], dict[tuple[str, str], list[int]]
         h = HEADER.match(line.strip())
         if h:
             scope = h.group(1).strip()
+            if scope in headers:
+                fail(f"duplicate TOML table: {scope}")
             headers[scope] = i
             continue
         m = ASSIGN.match(line)
@@ -86,7 +102,6 @@ def toml_entries(text: str) -> tuple[list[str], dict[tuple[str, str], list[int]]
             target = (scope, key)
         if target in KEYS:
             entries.setdefault(target, []).append(i)
-        # Inline features objects cannot safely be modified with line-based edits.
         if scope == "" and key == "features" and m.group(4).lstrip().startswith("{"):
             fail("inline 'features = {...}' is unsupported; use [features] or Codex config API")
     for key in KEYS:
@@ -101,12 +116,36 @@ def right_hand_side(line: str) -> str:
         fail(f"cannot parse TOML boolean setting: {line.strip()}")
     value = m.group(4).split("#", 1)[0].strip()
     if value not in ("true", "false"):
-        fail(f"expected boolean value, found {value!r}")
+        fail(f"expected TOML boolean value, found {value!r}")
     return value
 
 
+def toml_snapshot(text: str) -> dict:
+    lines, entries, _ = toml_entries(text)
+    result = {}
+    for scope, key in KEYS:
+        name = f"{scope}.{key}" if scope else key
+        indices = entries.get((scope, key), [])
+        result[name] = {
+            "present": bool(indices),
+            "value": right_hand_side(lines[indices[0]]) == "true" if indices else None,
+        }
+    return result
+
+
+def modified_bool_line(line: str, value: bool) -> str:
+    match = ASSIGN.match(line)
+    if not match:
+        fail(f"cannot modify TOML boolean line: {line.strip()}")
+    right = match.group(4)
+    m = re.match(r"^(\s*)(true|false)(\s*(?:#.*)?)$", right)
+    if not m:
+        fail(f"unsupported managed TOML value: {line.strip()}")
+    replacement = "true" if value else "false"
+    return f"{match.group(1)}{match.group(2)}{match.group(3)}{m.group(1)}{replacement}{m.group(3)}{match.group(5)}"
+
+
 def modify_toml(text: str, originals: dict | None, *, optimize: bool) -> tuple[str, dict]:
-    # Process one key at a time and reparse after each mutation because indices move.
     snapshot: dict = {} if originals is None else originals
     for scope, key in KEYS:
         identifier = f"{scope}.{key}" if scope else key
@@ -119,13 +158,10 @@ def modify_toml(text: str, originals: dict | None, *, optimize: bool) -> tuple[s
                     "line": lines[positions[0]] if positions else None,
                 }
             if positions:
-                index = positions[0]
-                m = ASSIGN.match(lines[index])
-                assert m
-                lines[index] = f"{m.group(1)}{m.group(2)}{m.group(3)}false{m.group(5)}"
+                lines[positions[0]] = modified_bool_line(lines[positions[0]], False)
             else:
                 if scope == "":
-                    first_header = next((i for i, line in enumerate(lines) if HEADER.match(line.strip())), len(lines))
+                    first_header = next((i for i, row in enumerate(lines) if HEADER.match(row.strip())), len(lines))
                     lines.insert(first_header, f"{key} = false\n")
                 elif scope in headers:
                     lines.insert(headers[scope] + 1, f"{key} = false\n")
@@ -138,16 +174,30 @@ def modify_toml(text: str, originals: dict | None, *, optimize: bool) -> tuple[s
         else:
             info = snapshot.get(identifier)
             if info is None:
-                fail(f"missing backup metadata for {identifier}")
-            if not positions:
-                fail(f"managed setting disappeared: {identifier}")
-            if right_hand_side(lines[positions[0]]) != "false":
-                fail(f"managed setting was changed externally: {identifier}")
+                fail(f"missing original backup metadata for {identifier}")
             if info["present"]:
-                lines[positions[0]] = info["line"]
-            else:
+                desired = right_hand_side(info["line"]) == "true"
+                if positions:
+                    if (right_hand_side(lines[positions[0]]) == "true") != desired:
+                        # Restore exactly the original field line, including comments.
+                        lines[positions[0]] = info["line"]
+                else:
+                    # The field was removed manually; recreate the original value.
+                    if scope == "":
+                        first_header = next((i for i, row in enumerate(lines) if HEADER.match(row.strip())), len(lines))
+                        lines.insert(first_header, info["line"])
+                    elif scope in headers:
+                        lines.insert(headers[scope] + 1, info["line"])
+                    else:
+                        if lines and not lines[-1].endswith("\n"):
+                            lines[-1] += "\n"
+                        if lines and lines[-1].strip():
+                            lines.append("\n")
+                        lines.extend([f"[{scope}]\n", info["line"]])
+            elif positions:
                 lines.pop(positions[0])
         text = "".join(lines)
+    validate_toml(text)
     return text, snapshot
 
 

@@ -445,6 +445,11 @@ def apply(args):
     old_cfg = state["file"][1]
     old_js = state["settings_file"][1]
     new_cfg = edit_toml(old_cfg, {k: doc_target[k] for k in TOML_KEYS}, target == "optimize")
+    if target == "native" and not state["manifest"].get("features_header_existed", True):
+        doc = parse_toml(new_cfg)
+        if "features" in doc and not doc["features"]:
+            del doc["features"]
+            new_cfg = canonicalize(tomlkit.dumps(doc))
     new_js = edit_json(old_js, {k: doc_target[k] for k in JSON_KEYS})
     needs_cfg = new_cfg != old_cfg
     needs_js = new_js != old_js

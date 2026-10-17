@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 022
 
-TOOL_VERSION="2.1.1"
+TOOL_VERSION="2.2.0"
 TOOL_HOME="${CODEX_TOOL_HOME:-$HOME/scripts/codex-tool}"
 VERSIONS_DIR="$TOOL_HOME/versions"
 DOWNLOADS_DIR="$TOOL_HOME/downloads"
@@ -753,7 +753,16 @@ managed_link_or_absent() {
 }
 
 background_policy_optimized() {
-  [[ -f "$CONFIG_DIR/background/manifest.json" ]]
+  local actual=""
+  actual="$(readlink "$CODEX_COMMAND" 2>/dev/null || true)"
+  if [[ -n "$actual" ]]; then
+    [[ "$actual" == "$TOOL_HOME/codex-launcher" ]]
+    return $?
+  fi
+  # No launcher exists yet: use live file evidence rather than a saved manifest.
+  local state=""
+  state="$(python3 "$TOOL_HOME/background_v2.py" status --no-api --codex-home "$CODEX_DATA_DIR" --config-dir "$CONFIG_DIR" 2>/dev/null)" || return 1
+  python3 -c 'import json,sys;sys.exit(0 if json.load(sys.stdin)["config"] == "optimized" else 1)' <<<"$state"
 }
 
 background_helper() {
@@ -762,7 +771,14 @@ background_helper() {
   [[ -f "$helper" ]] || die "background policy helper missing: $helper; rerun ./install.sh"
   local action="$1"
   shift
-  python3 "$helper" "$action" --codex-home "$CODEX_DATA_DIR" --config-dir "$CONFIG_DIR" "$@"
+  if [[ -f "$TOOL_HOME/background_v2.py" ]]; then
+    helper="$TOOL_HOME/background_v2.py"
+  fi
+  local current_codex=""
+  current_codex="$(version_codex_path "$(current_version 2>/dev/null || true)" 2>/dev/null || true)"
+  local args=()
+  [[ -z "$current_codex" ]] || args+=(--codex-bin "$current_codex")
+  python3 "$helper" "$action" --codex-home "$CODEX_DATA_DIR" --config-dir "$CONFIG_DIR" "${args[@]}" "$@"
 }
 
 background_policy_preflight() {
@@ -816,7 +832,7 @@ background_apply_policy() {
   background_helper "$action" "${args[@]}" || return 1
   BACKGROUND_PREFLIGHT_CHOICE=""
   BACKGROUND_POLICY_OVERRIDE=0
-  ensure_command_links
+  ensure_command_links "$choice"
 }
 
 background_supports_launcher() {
@@ -899,48 +915,39 @@ background_finish_activation() {
 background_status() {
   ensure_supported_platform
   need_cmd python3
-  need_cmd stat
   local description
-  description="$(background_helper status)" || return 1
+  description="$(background_helper status "$@")" || return 1
   python3 - "$description" <<'PY'
 import json,sys
 state=json.loads(sys.argv[1])
-print("Background policy:  " + state["mode"])
-print("Configuration:      " + state["effective"])
+print("Configuration:     " + state["config"])
+print("Codex API:         " + ("verified" if state["api_ok"] else "unavailable"))
+if state.get("api_error") and not state["api_ok"]:
+    print("API detail:         " + state["api_error"])
 if state["manifest_schema"]:
-    print("Manifest schema:    " + str(state["manifest_schema"]))
-for k,v in state["configuration"].items():
+    print("Backup schema:     " + str(state["manifest_schema"]))
+for k, field in state["configuration"].items():
+    v=field["value"] if field["present"] else "unset"
     print(f"  {k}: {str(v).lower() if isinstance(v,bool) else v}")
-for item in state.get("drift",[]):
-    value=item["current"]
-    target=item["target"]
-    current="<absent>" if not value["present"] else str(value["value"]).lower()
-    expected="<absent>" if not target["present"] else str(target["value"]).lower()
-    print(f"  DRIFT {item['key']}: current={current}, optimized={expected}")
+for item in state.get("drift", []):
+    print("  DRIFT " + item["key"])
+for k in state.get("overridden", []):
+    print("  OVERRIDDEN " + k)
 PY
   daemon_snapshot
   printf 'Managed app-server: %s\n' "$DAEMON_STATE"
-  local pids
+  local pids launcher=""
   pids="$(daemon_managed_pids)"
-  if [[ -n "$pids" ]]; then
-    printf 'Managed runtime PIDs: %s\n' "$(echo "$pids" | tr '\n' ' ')"
-    if background_policy_optimized; then
-      warn "optimized policy is configured but managed background processes remain; run codex-tool background optimize"
-    fi
-  else
-    printf 'Managed runtime PIDs: none\n'
+  printf 'Managed runtime PIDs: %s\n' "${pids:-(none)}"
+  launcher="$(readlink "$CODEX_COMMAND" 2>/dev/null || true)"
+  case "$launcher" in
+    "$TOOL_HOME/codex-launcher") printf 'Launcher:          optimized\n' ;;
+    "$CURRENT_LINK/bin/codex"|"$CURRENT_LINK/codex") printf 'Launcher:          native\n' ;;
+    *) printf 'Launcher:          mismatch or missing (%s)\n' "${launcher:-none}" ;;
+  esac
+  if [[ "$launcher" == "$TOOL_HOME/codex-launcher" && -n "$pids" ]]; then
+    warn "optimized launcher configured but managed background processes remain"
   fi
-  local expected_link="" actual_link=""
-  if background_policy_optimized; then
-    expected_link="$TOOL_HOME/codex-launcher"
-  else
-    expected_link="$CURRENT_LINK/bin/codex"
-  fi
-  actual_link="$(readlink "$CODEX_COMMAND" 2>/dev/null || true)"
-  if [[ -n "$actual_link" && "$actual_link" != "$expected_link" ]]; then
-    warn "codex launcher link differs from current background policy: $actual_link"
-  fi
-  return 0
 }
 
 background_command() {
@@ -970,6 +977,7 @@ background_command() {
 }
 
 ensure_command_links() {
+  local forced_mode="${1:-}"
   managed_link_or_absent "$TOOL_COMMAND" "$SELF_PATH" "codex-tool command"
   ln -sfn -- "$SELF_PATH" "$TOOL_COMMAND"
 
@@ -979,7 +987,7 @@ ensure_command_links() {
     codex_path="$(version_codex_path "$cv")"
     local relative
     if [[ "$codex_path" == */bin/codex ]]; then relative="$CURRENT_LINK/bin/codex"; else relative="$CURRENT_LINK/codex"; fi
-    if background_policy_optimized; then
+    if [[ "$forced_mode" == "optimized" ]] || { [[ -z "$forced_mode" ]] && background_policy_optimized; }; then
       relative="$TOOL_HOME/codex-launcher"
       [[ -x "$relative" ]] || die "optimized launcher is missing: $relative; rerun install.sh"
     fi
@@ -3372,20 +3380,43 @@ main() {
       list_versions
       return 0 ;;
     background)
-      [[ $# -ge 2 && $# -le 3 ]] || die "usage: codex-tool background {status|optimize|native} [--yes]"
-      local background_yes=0
-      if [[ $# -eq 3 ]]; then
-        [[ "$3" == "--yes" || "$3" == "-y" ]] || die "unknown background option: $3"
-        background_yes=1
-      fi
-      case "$2" in
+      [[ $# -ge 2 ]] || die "usage: codex-tool background {status|optimize|native} [--yes|--dry-run|--json|--cwd PATH]"
+      local background_yes=0 background_dry=0 background_json=0 background_cwd=""
+      shift
+      local background_action="$1"
+      shift
+      while (( $# )); do
+        case "$1" in
+          --yes|-y) background_yes=1; shift ;;
+          --dry-run) background_dry=1; shift ;;
+          --json) background_json=1; shift ;;
+          --cwd) [[ $# -ge 2 ]] || die "--cwd requires a path"; background_cwd="$2"; shift 2 ;;
+          *) die "unknown background option: $1" ;;
+        esac
+      done
+      case "$background_action" in
         status)
-          (( background_yes == 0 )) || die "background status does not accept --yes"
-          background_status ;;
+          (( ! background_yes && ! background_dry )) || die "background status does not accept --yes or --dry-run"
+          local bargs=()
+          (( ! background_json )) || bargs+=(--json)
+          [[ -z "$background_cwd" ]] || bargs+=(--cwd "$background_cwd")
+          if (( background_json )); then
+            background_helper status "${bargs[@]}"
+          else
+            background_status "${bargs[@]}"
+          fi ;;
         optimize|native)
-          init_manager_mutation
-          background_command "$2" "$background_yes" ;;
-        *) die "usage: codex-tool background {status|optimize|native} [--yes]" ;;
+          (( ! background_json )) || die "--json is only supported for status"
+          if (( background_dry )); then
+            local bargs=(--dry-run)
+            [[ -z "$background_cwd" ]] || bargs+=(--cwd "$background_cwd")
+            background_helper "$background_action" "${bargs[@]}"
+          else
+            [[ -z "$background_cwd" ]] || die "--cwd is only supported for status and dry-run"
+            init_manager_mutation
+            background_command "$background_action" "$background_yes"
+          fi ;;
+        *) die "unknown background action: $background_action" ;;
       esac
       return 0 ;;
   esac

@@ -2,7 +2,7 @@ name: codex-tool tests
 
 on:
   push:
-    branches: [main]
+    branches: [main, feat/background-reconciliation-v2.2]
   pull_request:
 
 jobs:
@@ -17,7 +17,9 @@ jobs:
           bash -n install.sh
       - name: Offline manual-download tests
         run: bash tests/test_downloads.sh
+      - name: Python dependency for background v2 tests
+        run: python3 -m pip install --user 'tomlkit==0.13.3'
       - name: Python syntax and behavior
         run: |
-          python3 -m py_compile background.py
+          python3 -m py_compile background.py background_v2.py
           python3 -m unittest discover -s tests -v

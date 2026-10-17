@@ -1,5 +1,6 @@
 """Mock the Codex app-server JSON-RPC protocol without starting a real daemon."""
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -86,7 +87,8 @@ class CodexApiRoundTripTests(unittest.TestCase):
                    "--codex-home", str(self.home),
                    "--config-dir", str(self.state),
                    "--codex-bin", str(self.binary), *args]
-        completed = subprocess.run(command, capture_output=True, text=True, timeout=25)
+        env = dict(os.environ, PYTHONPATH=str(ROOT / "vendor"))
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=25, env=env)
         if success:
             self.assertEqual(completed.returncode, 0, completed.stderr)
         else:

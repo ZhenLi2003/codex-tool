@@ -1,4 +1,4 @@
-# codex-tool 2.1.1 — Usage Guide
+# codex-tool 2.2.0 — Usage Guide
 
 Standalone Codex CLI version management for Linux x86_64, without root or npm.
 
@@ -16,6 +16,8 @@ The installer copies these files to `~/scripts/codex-tool/`:
 ```text
 codex-tool
 background.py
+background_v2.py
+vendor/tomlkit/
 codex-launcher
 ```
 
@@ -33,6 +35,10 @@ codex-tool list
 codex-tool background status
 codex-tool background optimize
 codex-tool background native
+codex-tool background status --json
+codex-tool background status --cwd ~/projects/example
+codex-tool background optimize --dry-run
+codex-tool background native --dry-run
 
 codex-tool clean [--all] [--dry-run] [--yes]
 codex-tool prune [--dry-run] [--purge-history] [--yes] [--force]
@@ -135,13 +141,13 @@ ${CODEX_TOOL_CONFIG_DIR:-~/.config/codex-tool}/background/
   backup/daemon-settings.json
 ```
 
-Private backup permissions are 0700 on directories and 0600 on files. Restoration is field-specific and leaves unrelated user edits intact. If another application changes a managed value during optimization, restoration fails instead of overwriting it without warning. Complex inline TOML feature tables are rejected conservatively rather than incorrectly rewritten.
+Private backup permissions are 0700 on directories and 0600 on files. Restoration is field-specific and leaves unrelated user edits intact. If another application changes a managed value during optimization, restoration fails instead of overwriting it without warning. TOML is parsed as a full document tree and formatted globally, while retaining existing user comments and semantically identical unrelated fields. Codex's official batch-write API is authoritative for managed user-level TOML values and enforces version and policy constraints. Unsupported API writes fail closed. The bundled TOML parser requires neither pip nor root privileges.
 
 Run `codex-tool background native` to revert before manually editing managed fields, or resolve a reported conflict explicitly.
 
 ### Configuration reconciliation after manual edits
 
-The helper records Original (before the first optimization), Applied (the last managed policy), and Current (the actual TOML/JSON files). A schema-v1 manifest is supported and is migrated to schema-v2 the next time optimization is committed; the original backup files are **never replaced** by a later optimize.
+The helper records Original (before the first optimization), Applied (the last managed policy), and Current (the actual TOML/JSON files). A schema-v1 manifest is supported and is migrated to schema-v3 the next time optimization is committed; the original backup files are **never replaced** by a later optimize.
 
 ```bash
 codex-tool background status
@@ -151,7 +157,7 @@ codex-tool background native
 codex-tool background native --yes
 ```
 
-`background status` distinguishes the saved mode from the actual configuration (`optimized` or `modified`) and shows the changed managed keys. Unmanaged settings do not count as drift.
+`background status` reads live fields, reports configuration state independent of the manifest, checks official `config/read` configuration layers when a Codex binary is available, and separately describes managed daemon, process IDs, and launcher. The manifest retains original field metadata solely for Native restoration. Unmanaged settings do not count as drift.
 
 Reapplying optimization after manual changes requires `[y/N]` confirmation; in noninteractive scripts, `--yes` explicitly authorizes overwriting managed keys. Restoring Native requires no confirmation when each managed key is either in its previously Applied state or already manually returned to its Original state. Third-state edits require explicit approval. Original values, including absence of a key, are restored per field; other TOML/JSON settings are left intact.
 

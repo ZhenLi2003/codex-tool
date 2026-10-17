@@ -49,6 +49,7 @@ ACTIVATION_REQUEST="optimized"
 ACTIVATION_EFFECTIVE="native"
 BACKGROUND_PREFLIGHT_CHOICE=""
 BACKGROUND_POLICY_OVERRIDE=0
+BACKGROUND_CODEX_BINARY_OVERRIDE=""
 
 log()  { printf '==> %s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
@@ -775,7 +776,8 @@ background_helper() {
     helper="$TOOL_HOME/background_v2.py"
   fi
   local current_codex=""
-  current_codex="$(version_codex_path "$(current_version 2>/dev/null || true)" 2>/dev/null || true)"
+  current_codex="$BACKGROUND_CODEX_BINARY_OVERRIDE"
+  [[ -n "$current_codex" ]] || current_codex="$(version_codex_path "$(current_version 2>/dev/null || true)" 2>/dev/null || true)""
   local args=()
   [[ -z "$current_codex" ]] || args+=(--codex-bin "$current_codex")
   python3 "$helper" "$action" --codex-home "$CODEX_DATA_DIR" --config-dir "$CONFIG_DIR" "${args[@]}" "$@"
@@ -882,6 +884,8 @@ background_choose_activation() {
 
 background_prepare_activation() {
   local version="$1" staged_binary="${2:-}"
+  BACKGROUND_CODEX_BINARY_OVERRIDE="$staged_binary"
+  [[ -n "$BACKGROUND_CODEX_BINARY_OVERRIDE" ]] || BACKGROUND_CODEX_BINARY_OVERRIDE="$(version_codex_path "$version" 2>/dev/null || true)"
   background_choose_activation "$version" "$staged_binary"
 
   # Detect drift before stopping the daemon or changing the version.
@@ -905,6 +909,7 @@ background_prepare_activation() {
 }
 
 background_finish_activation() {
+  BACKGROUND_CODEX_BINARY_OVERRIDE=""
   if [[ "$ACTIVATION_EFFECTIVE" == "optimized" ]]; then
     log "Codex foreground optimization active; shared daemon/updater remain stopped"
     return 0
@@ -917,37 +922,47 @@ background_status() {
   need_cmd python3
   local description
   description="$(background_helper status "$@")" || return 1
-  python3 - "$description" <<'PY'
-import json,sys
-state=json.loads(sys.argv[1])
-print("Configuration:     " + state["config"])
-print("Codex API:         " + ("verified" if state["api_ok"] else "unavailable"))
-if state.get("api_error") and not state["api_ok"]:
-    print("API detail:         " + state["api_error"])
-if state["manifest_schema"]:
-    print("Backup schema:     " + str(state["manifest_schema"]))
-for k, field in state["configuration"].items():
-    v=field["value"] if field["present"] else "unset"
-    print(f"  {k}: {str(v).lower() if isinstance(v,bool) else v}")
-for item in state.get("drift", []):
-    print("  DRIFT " + item["key"])
-for k in state.get("overridden", []):
-    print("  OVERRIDDEN " + k)
-PY
   daemon_snapshot
-  printf 'Managed app-server: %s\n' "$DAEMON_STATE"
   local pids launcher=""
   pids="$(daemon_managed_pids)"
-  printf 'Managed runtime PIDs: %s\n' "${pids:-(none)}"
   launcher="$(readlink "$CODEX_COMMAND" 2>/dev/null || true)"
-  case "$launcher" in
-    "$TOOL_HOME/codex-launcher") printf 'Launcher:          optimized\n' ;;
-    "$CURRENT_LINK/bin/codex"|"$CURRENT_LINK/codex") printf 'Launcher:          native\n' ;;
-    *) printf 'Launcher:          mismatch or missing (%s)\n' "${launcher:-none}" ;;
-  esac
-  if [[ "$launcher" == "$TOOL_HOME/codex-launcher" && -n "$pids" ]]; then
-    warn "optimized launcher configured but managed background processes remain"
-  fi
+  python3 - "$description" "$DAEMON_STATE" "$pids" "$launcher" "$TOOL_HOME/codex-launcher" "$CURRENT_LINK/bin/codex" "$CURRENT_LINK/codex" "$@" <<'PY'
+import json,sys
+state=json.loads(sys.argv[1])
+runtime=sys.argv[2]
+pids=sys.argv[3].split()
+link=sys.argv[4]
+launcher=("optimized" if link == sys.argv[5] else
+          "native" if link in (sys.argv[6],sys.argv[7]) else
+          "missing" if not link else "mismatch")
+native=(state["config"]=="native-compatible" and launcher=="native")
+healthy=(state["api_ok"] and not pids and
+         ((state["config"]=="optimized" and launcher=="optimized" and runtime=="stopped") or native))
+state["runtime"]={"state":runtime,"pids":pids}
+state["launcher"]=launcher
+state["health"]=("healthy" if healthy else "unknown" if not state["api_ok"] or runtime=="unknown"
+                 else "degraded")
+if "--json" in sys.argv[8:]:
+    print(json.dumps(state,ensure_ascii=False))
+else:
+    print("Configuration:     " + state["config"])
+    print("Codex API:         " + ("verified" if state["api_ok"] else "unavailable"))
+    if state.get("api_error") and not state["api_ok"]:
+        print("API detail:         " + state["api_error"])
+    if state["manifest_schema"]:
+        print("Backup schema:     " + str(state["manifest_schema"]))
+    for k,field in state["configuration"].items():
+        v=field["value"] if field["present"] else "unset"
+        print(f"  {k}: {str(v).lower() if isinstance(v,bool) else v}")
+    for item in state.get("drift", []):
+        print("  DRIFT " + item["key"])
+    for k in state.get("overridden", []):
+        print("  OVERRIDDEN " + k)
+    print("Managed daemon:    " + runtime)
+    print("Managed PIDs:      " + (", ".join(pids) if pids else "none"))
+    print("Launcher:          " + launcher)
+    print("Overall health:    " + state["health"])
+PY
 }
 
 background_command() {
@@ -3400,11 +3415,7 @@ main() {
           local bargs=()
           (( ! background_json )) || bargs+=(--json)
           [[ -z "$background_cwd" ]] || bargs+=(--cwd "$background_cwd")
-          if (( background_json )); then
-            background_helper status "${bargs[@]}"
-          else
-            background_status "${bargs[@]}"
-          fi ;;
+          background_status "${bargs[@]}" ;;
         optimize|native)
           (( ! background_json )) || die "--json is only supported for status"
           if (( background_dry )); then

@@ -10,8 +10,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 try:
-    import tomlkit
     import background_v2 as engine
+    import tomlkit
 except ImportError:
     engine = None
 

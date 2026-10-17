@@ -25,7 +25,7 @@ export PATH="$HOME/.local/bin:$PATH"
 codex-tool version
 ```
 
-安装器将 `codex-tool`、`background.py` 和 `codex-launcher` 安装到 `~/scripts/codex-tool/`。**只安装管理器不会修改 Codex 用户配置**；激活 Codex 版本时才自动优化。
+安装器将 `codex-tool`、`background.py`、`background_v2.py`、随包 TOML 解析器和 `codex-launcher` 安装到 `~/scripts/codex-tool/`。**只安装管理器不会修改 Codex 用户配置**；激活 Codex 版本时才自动优化。
 
 ## 版本管理
 
@@ -60,7 +60,13 @@ Optimize background runtime and continue? [y/N]
 codex-tool background status
 codex-tool background optimize
 codex-tool background native
+codex-tool background status --json
+codex-tool background status --cwd ~/projects/example
+codex-tool background optimize --dry-run
+codex-tool background native --dry-run
 ```
+
+v2.2.0 在每次执行后台命令时重新读取文件配置、Codex 生效配置及配置来源，并独立检测 daemon 和 launcher。`manifest.json` 仅供原始字段恢复，不再决定当前配置状态。TOML 采用随包 `tomlkit` 完整解析及全局排版，官方 `config/batchWrite` 负责修改用户级字段；后台 JSON 单独结构化修改。若 API 无法验证或无法写入，工具拒绝假报成功。Native 通过 schema v3（兼容 v1/v2）恢复原始字段。
 
 Optimized 将以下配置字段设为 `false`：
 

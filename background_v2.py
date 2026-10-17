@@ -457,6 +457,15 @@ def apply(args):
             del doc["features"]
             new_cfg = canonicalize(tomlkit.dumps(doc))
     new_js = edit_json(old_js, {k: doc_target[k] for k in JSON_KEYS})
+    if target == "native":
+        # Only prune empty JSON parents absent in the first-optimization snapshot.
+        source_backup = policy / "backup" / "daemon-settings.json"
+        if source_backup.exists() and not source_backup.is_symlink():
+            backup_tree = json_tree(source_backup.read_text("utf-8"))
+            restored_tree = json_tree(new_js)
+            if "updater" not in backup_tree and restored_tree.get("updater") == {}:
+                restored_tree.pop("updater")
+                new_js = json.dumps(restored_tree, indent=2, ensure_ascii=False) + "\n"
     needs_cfg = new_cfg != old_cfg
     needs_js = new_js != old_js
     if args.dry_run:

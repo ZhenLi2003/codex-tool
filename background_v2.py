@@ -15,6 +15,7 @@ import subprocess
 import sys
 import time
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / 'vendor'))
 import tomlkit
 
 import background as legacy
@@ -268,7 +269,7 @@ def collect(args):
         config_state = "unknown" if toml_matches and daemon_matches else config_state
     return {"config": config_state, "configuration": current, "effective": effective,
             "drift": drift, "overridden": overrides, "api_ok": api is not None,
-            "api_error": api_error, "layers": (api or {}).get("read", {}).get("layers"),
+            "api_error": api_error, "layers": [{"name": row.get("name"), "version": row.get("version"), "disabledReason": row.get("disabledReason")} for row in ((api or {}).get("read", {}).get("layers") or [])],
             "manifest_schema": manifest.get("schema") if manifest else None,
             "manifest": manifest, "api": api, "file": (cfg_exists, cfg, cfg_mode),
             "settings_file": (settings_exists, settings_text, settings_mode),
@@ -345,6 +346,10 @@ def edit_toml(text, changes, annotate_managed):
             target[name] = meta["value"]
         elif name in target:
             del target[name]
+    if ("features" not in original and "features" in doc and
+            not doc["features"] and
+            not changes.get("features.daemon_auto_start", {}).get("present", False)):
+        del doc["features"]
     raw = tomlkit.dumps(doc)
     output = canonicalize(raw)
     if annotate_managed:

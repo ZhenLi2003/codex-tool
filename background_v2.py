@@ -393,6 +393,12 @@ def edit_json(text, changes):
                 node[parts[-1]] = meta["value"]
             else:
                 node.pop(parts[-1], None)
+    # Remove an empty parent introduced solely by the optimizer, not a user-owned table.
+    for key, meta in changes.items():
+        if key in JSON_KEYS and not meta["present"] and "." in key:
+            parent = key.split(".")[0]
+            if parent not in original and tree.get(parent) == {}:
+                tree.pop(parent)
     if original == tree:
         return text
     return json.dumps(tree, indent=2, ensure_ascii=False) + "\n"

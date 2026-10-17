@@ -935,9 +935,9 @@ link=sys.argv[4]
 launcher=("optimized" if link == sys.argv[5] else
           "native" if link in (sys.argv[6],sys.argv[7]) else
           "missing" if not link else "mismatch")
-native=(state["config"]=="native-compatible" and launcher=="native")
-healthy=(state["api_ok"] and not pids and
-         ((state["config"]=="optimized" and launcher=="optimized" and runtime=="stopped") or native))
+native=(state["config"] in ("native-compatible","optimized") and launcher=="native")
+healthy=(state["api_ok"] and
+         ((state["config"]=="optimized" and launcher=="optimized" and not pids and runtime=="stopped") or native))
 state["runtime"]={"state":runtime,"pids":pids}
 state["launcher"]=launcher
 state["health"]=("healthy" if healthy else "unknown" if not state["api_ok"] or runtime=="unknown"

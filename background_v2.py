@@ -521,6 +521,8 @@ def apply(args):
                                     target == "optimize")
                 if checked_file(settings_path) != state["settings_file"]:
                     fail("daemon settings changed concurrently")
+                if checked_file(conf_path)[1] != intermediate:
+                    fail("Codex config changed after API write, before formatting; retry")
                 wrote_config = intermediate != old_cfg
                 atomic_write(conf_path, new_cfg, state["file"][2])
             else:

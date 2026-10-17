@@ -261,8 +261,10 @@ def collect(args):
         effective[k] = {"value": value, "origin": origin_key(api, k)}
         if api is not None and value is not None and value is not False:
             overrides.append(k)
-    config_state = ("optimized" if toml_matches and daemon_matches
-                    else "drifted" if manifest else "native-compatible")
+    disabled = [current[k]["present"] and current[k]["value"] is False for k in ALL_KEYS]
+    # File-state classification must never depend on persisted recovery metadata.
+    config_state = ("optimized" if toml_matches and daemon_matches else
+                    "drifted" if any(disabled) else "native-compatible")
     if overrides:
         config_state = "overridden"
     if api is None and not args.no_api:

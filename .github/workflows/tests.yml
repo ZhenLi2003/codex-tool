@@ -17,6 +17,8 @@ jobs:
           bash -n install.sh
       - name: Offline manual-download tests
         run: bash tests/test_downloads.sh
+      - name: Offline installer and status smoke test
+        run: bash tests/test_cli_install_smoke.sh
       - name: Vendored parser import check
         run: python3 -c 'import sys; sys.path.insert(0, "vendor"); import tomlkit; print(tomlkit.__version__)'
       - name: Python syntax and behavior

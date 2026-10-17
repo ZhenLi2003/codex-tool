@@ -777,7 +777,7 @@ background_helper() {
   fi
   local current_codex=""
   current_codex="$BACKGROUND_CODEX_BINARY_OVERRIDE"
-  [[ -n "$current_codex" ]] || current_codex="$(version_codex_path "$(current_version 2>/dev/null || true)" 2>/dev/null || true)""
+  [[ -n "$current_codex" ]] || current_codex="$(version_codex_path "$(current_version 2>/dev/null || true)" 2>/dev/null || true)"
   local args=()
   [[ -z "$current_codex" ]] || args+=(--codex-bin "$current_codex")
   python3 "$helper" "$action" --codex-home "$CODEX_DATA_DIR" --config-dir "$CONFIG_DIR" "${args[@]}" "$@"

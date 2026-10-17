@@ -18,6 +18,8 @@ die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [[ -x "$SRC_DIR/codex-tool" ]] || die "codex-tool payload is missing"
 [[ -f "$SRC_DIR/background.py" ]] || die "background.py payload is missing"
+[[ -f "$SRC_DIR/background_v2.py" ]] || die "background_v2.py payload is missing"
+[[ -f "$SRC_DIR/vendor/tomlkit/__init__.py" ]] || die "vendored tomlkit is missing"
 [[ -f "$SRC_DIR/codex-launcher" ]] || die "codex-launcher payload is missing"
 
 need_cmd() {
@@ -288,6 +290,10 @@ recover_legacy_manager_locks
 mkdir -p "$TOOL_HOME" "$TOOL_HOME/versions" "$TOOL_HOME/downloads" "$BIN_DIR"
 install -m 0755 "$SRC_DIR/codex-tool" "$TOOL_HOME/codex-tool"
 install -m 0644 "$SRC_DIR/background.py" "$TOOL_HOME/background.py"
+install -m 0644 "$SRC_DIR/background_v2.py" "$TOOL_HOME/background_v2.py"
+mkdir -p "$TOOL_HOME/vendor/tomlkit"
+find "$SRC_DIR/vendor/tomlkit" -maxdepth 1 -type f -name "*.py" -exec install -m 0644 -t "$TOOL_HOME/vendor/tomlkit" {} +
+install -m 0644 "$SRC_DIR/vendor/tomlkit.LICENSE" "$TOOL_HOME/vendor/tomlkit.LICENSE"
 install -m 0755 "$SRC_DIR/codex-launcher" "$TOOL_HOME/codex-launcher"
 [[ ! -f "$SRC_DIR/README.md" ]] || install -m 0644 "$SRC_DIR/README.md" "$TOOL_HOME/README.md"
 

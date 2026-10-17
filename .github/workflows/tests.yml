@@ -2,7 +2,7 @@ name: codex-tool tests
 
 on:
   push:
-    branches: [main]
+    branches: [main, feat/background-reconciliation-v2.2]
   pull_request:
 
 jobs:
@@ -17,7 +17,11 @@ jobs:
           bash -n install.sh
       - name: Offline manual-download tests
         run: bash tests/test_downloads.sh
+      - name: Offline installer and status smoke test
+        run: bash tests/test_cli_install_smoke.sh
+      - name: Vendored parser import check
+        run: python3 -c 'import sys; sys.path.insert(0, "vendor"); import tomlkit; print(tomlkit.__version__)'
       - name: Python syntax and behavior
         run: |
-          python3 -m py_compile background.py
+          python3 -m py_compile background.py background_v2.py
           python3 -m unittest discover -s tests -v

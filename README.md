@@ -24,7 +24,7 @@ export PATH="$HOME/.local/bin:$PATH"
 codex-tool version
 ```
 
-The installer copies `codex-tool`, `background.py`, and `codex-launcher` into `~/scripts/codex-tool/`. It does **not** change Codex's user configuration merely because the manager was installed. Background optimization is applied when a Codex version is activated.
+The installer copies `codex-tool`, `background.py`, `background_v2.py`, the vendored TOML parser, and `codex-launcher` into `~/scripts/codex-tool/`. It does **not** change Codex's user configuration merely because the manager was installed. Background optimization is applied when a Codex version is activated.
 
 ## Version management
 
@@ -57,6 +57,10 @@ Stopping managed background work can interrupt active/disconnected tasks; inspec
 codex-tool background status
 codex-tool background optimize
 codex-tool background native
+codex-tool background status --json
+codex-tool background status --cwd ~/projects/example
+codex-tool background optimize --dry-run
+codex-tool background native --dry-run
 ```
 
 **Optimized** sets the following managed configuration entries to `false`:
@@ -77,7 +81,7 @@ And in `CODEX_HOME/app-server-daemon/settings.json`:
 }
 ```
 
-Only these fields are managed; all other keys are preserved.
+Only these field values are managed; the v2.2 editor parses the full TOML tree, canonicalizes global spacing, and rejects changes to unrelated values. Configuration status comes from current files and an optional live Codex `config/read` probe, independently of saved recovery metadata. Actual daemon processes and the launcher are reported separately. User-level TOML changes use official `config/batchWrite` with version checks; daemon JSON is handled locally. On an unsupported or unavailable API, writes fail safely rather than silently bypassing the API. The original field metadata is retained for Native rollback (manifest schema v3).
 
 Optimized mode changes the `~/.local/bin/codex` link to the installed `codex-launcher`, which adds `--no-daemon` to ordinary interactive Codex, `resume`, and `fork` calls. Explicit daemon/service management commands and other noninteractive commands are forwarded to the actual Codex binary. Therefore, ordinary TUI use does not start or reuse a shared app-server. This does not promise that unrelated MCP subprocesses or explicitly requested background work never run.
 

@@ -2,6 +2,15 @@
 
 This file summarizes the major iterations of `codex-tool`.
 
+## 2.2.0
+
+- Added live background configuration reconciliation independent of manifest-exists mode detection; inspect current TOML/JSON, Codex configuration API, managed process runtime and launcher independently.
+- Added official app-server `config/read`, `configRequirements/read` and version-checked `config/batchWrite` for user-level TOML edits. Unsupported or overridden configurations fail safely.
+- Vendored the upstream tomlkit 0.13.3 source and license for offline non-root installation, with full TOML-tree editing, normalized document formatting and managed comments.
+- Added original-field recovery metadata schema v3, retaining legacy v1/v2 migration without replacing historical backup files.
+- Added `background status --json`, `background status --cwd PATH`, and configuration `--dry-run` for Optimized/Native, including independent daemon and launcher diagnostic fields.
+- Expanded CI with mocked JSON-RPC integration tests, configuration roundtrips, drift detection and no-pip dependency validation.
+
 ## 2.1.1
 
 - Keep managed `[features]` table boundaries visually tidy with a single blank line, while preserving unrelated TOML tables and user comments.
